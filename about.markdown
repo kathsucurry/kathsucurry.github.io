@@ -14,5 +14,5 @@ I come from a background in computer science, biomedical informatics, and machin
 </p>
 
 <p>
-When I'm not deep in code, you'll likely find me solving sudoku puzzles, crocheting something new, or watching anime.
+When I'm not deep in code, you'll likely find me solving sudoku puzzles, playing piano, or watching anime.
 </p>
