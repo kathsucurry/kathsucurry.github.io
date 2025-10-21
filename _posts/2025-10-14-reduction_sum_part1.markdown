@@ -25,7 +25,7 @@ And you can find the relevant code below. Note the identical and interchangeable
 
 ```c++
 template <size_t NUM_THREADS>
-__global__ void batched_original_interleaved_address_0(
+__global__ void batched_interleaved_address_naive(
     float* __restrict__ Y,
     float const* __restrict__ X,
     size_t num_elements_per_batch
@@ -123,7 +123,8 @@ There is a slight improvement from Kernel 0 to Kernel 1, although it's not parti
 When profiling the kernel with Nsight Compute, we identify a new performance optimization opportunity: addressing *Shared Load Bank Conflicts*.
 
 
-<TODO: add screenshot here>
+![image Bank conflicts](/assets/images/2025-10-14-reduction_sum_part1/kernel1_bank_conflict.png)
+<p style="text-align: center;"><i>A new optimization opportunity observed on Nsight Compute: addressing bank conflicts.</i></p>
 
 *What are shared load (or shared memory) bank conflicts, and why does Kernel 1 have this issue?*
 
@@ -134,16 +135,131 @@ To answer this question, we need to examine how shared memory is organized. Acco
 
 One or more **bank conflicts** occur when multiple threads in the same warp request *different memory addresses* that are mapped to the same memory bank. These accesses are then serialized, which consequently reduces the effective bandwidth by a factor equal to the number of the memory requests targeting that bank.
 
-In Kernel 0, no bank conflicts occur because threads within the same warp always request addresses that are mapped to different banks. The figure below illustrates the memory requests by threads in warp 0 during the first two iterations of the `for` loop. In iteration 0 (`stride = 1`), thread 0 requests shared memory elements at indices 0 and 1 (located in bank 0 and 1, respectively), thread index 2 requests elements at index 2 and 3 (located in bank 2 and 3), and so on. The same pattern remains consistent across subsequent iterations and for all other warps.
+In Kernel 0, no bank conflicts occur because threads within the same warp always request addresses that are mapped to different banks. The figure below illustrates the read memory requests by threads in warp 0 (thread index 0 to 31) during the first two iterations of the `for` loop. In iteration 0 (`stride = 1`), thread 0 requests shared memory elements at indices 0 and 1 (located in bank 0 and 1, respectively), thread index 2 requests elements at index 2 and 3 (located in bank 2 and 3), and so on. The same pattern remains consistent across subsequent iterations and for all other warps.
 
 ![image Memory requests in Kernel 0](/assets/images/2025-10-14-reduction_sum_part1/kernel1_kernel0_requests.png)
 <p style="text-align: center;"><i>The memory requests by warp 0 threads in Kernel 0 during the first two iterations</i></p>
 
-In contrast, since the threads performing memory access are grouped into a contiguous block in Kernel 1, bank conflicts occur consistently in all iterations. The figure below illustrates the first two iterations, where a **2-way bank conflicts** occur in the first iteration and **4-way bank conflicts** occur in the second iteration. This behavior can significantly reduce the overall effective bandwidth.
+In contrast, since the threads performing memory access are grouped into a contiguous block in Kernel 1, bank conflicts occur consistently in all iterations. The figure below illustrates the read memory accesses during the first two iterations, where a **2-way bank conflicts** occur in the first iteration and **4-way bank conflicts** occur in the second iteration. This behavior can significantly reduce the overall effective bandwidth.
 
 ![image Memory requests in Kernel 1](/assets/images/2025-10-14-reduction_sum_part1/kernel1_kernel1_requests.png)
 <p style="text-align: center;"><i>The memory requests by warp 0 threads in Kernel 1 during the first two iterations. Bank conflicts occur in both iterations.</i></p>
 
+In summary, although Kernel 1 resolves the thread divergence issue present in Kernel 0, the shared memory bank conflict issue still needs to be addressed.
+
 > 📝 **Note**
 >
 > A bank conflict does not occur when multiple threads within the same warp access any address within the same 32-bit word. In the case of 4-byte floating-point elements (i.e., 32 bits), bank conflicts do not occur when multiple threads access the *same* address. For read operations, the requested element is broadcast to the requesting threads, while for write operations, each address is written by one of the threads. More details can be found in [CUDA C Programming Guide](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#shared-memory-5-x).
+
+
+# Kernel 2: sequential addressing
+
+The next implementation addresses the shared memory bank conflict issue observed in Kernel 1 by storing the intermediate sum values in **sequential shared memory addresses**. The following figure illustrates the updated approach.
+
+![image Sequential addressing](/assets/images/2025-10-14-reduction_sum_part1/kernel2_sequential_address.png)
+<p style="text-align: center;"><i>The sequential addressing kernel.</i></p>
+
+In the code, we simply change the following rows from Kernel 1:
+
+```c++
+    for (size_t stride = 1; stride < NUM_THREADS; stride *= 2) {
+        size_t index = 2 * stride * thread_idx;
+
+        if (index < NUM_THREADS)
+            shared_data[index] += shared_data[index + stride];
+        __syncthreads();
+    }
+```
+
+to:
+
+```c++
+    for (size_t stride = NUM_THREADS / 2; stride > 0; stride >>= 1) {
+        if (thread_idx < stride)
+            shared_data[thread_idx] += shared_data[thread_idx + stride];
+        __syncthreads();
+    }
+```
+
+Interestingly, **we don't observe any speedup between Kernel 1 and Kernel 2**, which contrasts with nearly 2x performance improvement reported in Mark Harris's presentation.
+
+| Kernel # <br />(128 threads/block) | Runtime (µs) | Mean Effective Bandwidth | % Peak Bandwidth |
+|:---:|:---:|:---:|:---:|
+| kernel 0 | 5,017.23 | 431.366 | 48.14 |
+| kernel 1 | 4,962.33 | 436.138 | 48.67 |
+| 🆕 kernel 2 🆕 | 4,968.31 | 435.613 | 48.61 |
+
+*What accounts for the discrepancy between the performance differences observed in this post and those reported in Mark Harris's presentation?*
+
+One possible explanation is **the improved shared memory performance under bank conflict conditions in newer GPU generations**. While I haven't been able to find any explicit statement from NVIDIA confirming this, a [2016 paper titled *"Dissecting GPU Memory Hierarchy Through Microbenchmarking"*](https://ieeexplore.ieee.org/document/7445236) demonstrated that newer GPU architectures at the time exhibited a lower performance penalty under bank conflict scenarios (see Table 8 in the paper). It's worth noting that Mark Harris's presentation dates back to 2007. It is possible that the penalty is even smaller on more recent architectures, such as Blackwell. That said, addressing shared memory bank conflicts remains important for achieving optimal performance.
+
+# Kernel 3: repositioning `__syncthreads()`
+
+Kernel 2 includes two thread synchronizations: (1) after loading elements from global memory to shared memory, and 2) at the end of each `for` loop iteration to ensure all thread updates to shared memory are completed. We can further simplify this by **removing one synchronization and repositioning the other to the beginning of the `for` loop**.
+
+By synchronizing threads at the **start** of the loop, we ensure that the initial shared memory load from global memory is complete before any computation begins. The only synchronization removed is the **final one**, which would have occurred at the end of the **last** iteration: when only a single thread updates the first shared memory element.
+
+This removal is safe because the same thread that performs the final update is also responsible for writing the result back to global memory after the loop ends. Since no other threads are involved at this point, **no synchronization is necessary**.
+
+To summarize, we change the following code:
+
+```c++
+    // Store a single element per thread in shared memory.
+    shared_data[thread_idx] = X[thread_idx];
+    __syncthreads(); // The first synchronization.
+
+    for (size_t stride = NUM_THREADS / 2; stride > 0; stride >>= 1) {
+        if (thread_idx < stride)
+            shared_data[thread_idx] += shared_data[thread_idx + stride];
+        __syncthreads(); // The second synchronization.
+    }
+```
+
+to
+
+```c++
+    // Store a single element per thread in shared memory.
+    shared_data[thread_idx] = X[thread_idx];
+
+    for (size_t stride = NUM_THREADS / 2; stride > 0; stride >>= 1) {
+        __syncthreads(); // The repositioned synchronization.
+        if (thread_idx < stride)
+            shared_data[thread_idx] += shared_data[thread_idx + stride];
+    }
+```
+
+which gives us a better performance as shown below.
+
+| Kernel # <br />(128 threads/block) | Runtime (µs) | Mean Effective Bandwidth | % Peak Bandwidth |
+|:---:|:---:|:---:|:---:|
+| kernel 0 | 5,017.23 | 431.366 | 48.14 |
+| kernel 1 | 4,962.33 | 436.138 | 48.67 |
+| kernel 2 | 4,968.31 | 435.613 | 48.61 |
+| 🆕 kernel 3 🆕 | 4,512.13 | 479.654 | 53.53 |
+
+
+# Kernel 4: thread coarsening
+
+Recall in all the kernels so far, after loading elements from global memory into shared memory, half of the threads (`N / 2`) become idle at the start of the `for` loop. In the second iteration, `N / 4` threads become idle, then `N / 8` in the third, and so on, until only one thread remains active in the final iteration. This progressive underutilization of resources, exacerbated by the attempt to maximize parallelism (i.e., launching as many threads as possible), can significantly impact performance.
+
+One fundamental optimization technique to address this issue is **thread coarsening**. The idea is to have each thread perform more work, thereby reducing the total number of threads launched and minimizing parallelization overhead. In this context, I'm merging Mark Harris's Kernel 4 and Kernel 7, and will experiment with varying the number of elements each thread loads and adds. The implementation is illustrated by the figure below.
+
+![image Thread coarsening](/assets/images/2025-10-14-reduction_sum_part1/kernel4_thread_coarsening.png)
+<p style="text-align: center;"><i>The thread coarsening kernel where the number of elements per thread is set to 3.</i></p>
+
+Experimenting with varying number of elements per thread using the 128-thread configuration leads to the following result.
+
+| # elements per thread | Runtime (µs) | Mean Effective Bandwidth | % Peak Bandwidth |
+|:---:|:---:|:---:|:---:|
+| 1 | 4,643.64 | 466.070 | 52.01 |
+| 2 | 2,553.32 | 844.339 | 94.23 |
+| 4 | 2,532.10 | 849.761 | 94.83 |
+| 8 | 2,523.05 | 851.978 | 95.08 |
+| 16 | 2,519.19 | 852.866 | 95.18 |
+| 32 | 2,517.57 | 853.208 | 95.22 |
+| 64 | 2,517.41 | 853.155 | 95.21 |
+| 128 | 2,518.28 | 852.810 | 95.17 |
+| 256 | 2,517.61 | 853.011 | 95.19 |
+| 512 | 2,519.89 | 852.225 | 95.11 |
+| 1,024 | 2,524.26 | 850.743 | 94.94 |
+| 2,048 | 2,526.57 | 849.964 | 94.85 |
