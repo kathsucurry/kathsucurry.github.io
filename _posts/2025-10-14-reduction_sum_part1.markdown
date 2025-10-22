@@ -10,8 +10,9 @@ categories: cuda
 As part of the "Reduction (Sum)" series, this post outlines my process and approach to implementing and optimizing sum reduction kernels. I use Mark Harris's [*Optimizing Parallel Reduction in CUDA* deck](https://developer.download.nvidia.com/assets/cuda/files/reduction.pdf) as a reference, with modifications based on the insights I've gained along the way. My approach can be summarized as follows.
 
 1. **Implement the reduction kernel** and ensure that the output is correct using the verification process described in the [previous post]({% link _posts/2025-10-14-reduction_sum_part0.markdown %}).
-2. **Profile the kernel** using [NVIDIA Nsight Compute](https://developer.nvidia.com/nsight-compute). I highly recommend you to watch [this kernel profiling lecture](https://www.youtube.com/watch?v=F_BazucyCMw&t=1s) hosted by GPU Mode if you are interested in using Nsight Compute.
-3. **Inspect the PTX/SASS**, if necessary, to better understand the performance characteristics or identify optimization opportunities.
+2. **Analyze the kernel's performance** to understand whether (and why) it performs better or worse. Some methods include:
+    -  **Profile the kernel** using [NVIDIA Nsight Compute](https://developer.nvidia.com/nsight-compute). I highly recommend you to watch [this kernel profiling lecture](https://www.youtube.com/watch?v=F_BazucyCMw&t=1s) hosted by GPU Mode if you are interested in using Nsight Compute.
+    - **Inspect the PTX/SASS**, if necessary, to better understand the performance characteristics or identify optimization opportunities.
 
 
 # Kernel 0: naive interleaved addressing
@@ -247,6 +248,31 @@ One fundamental optimization technique to address this issue is **thread coarsen
 ![image Thread coarsening](/assets/images/2025-10-14-reduction_sum_part1/kernel4_thread_coarsening.png)
 <p style="text-align: center;"><i>The thread coarsening kernel where the number of elements per thread is set to 3.</i></p>
 
+In the implementation code, we replace the code line that stores an element from global memory to shared memory:
+
+```c++
+    // Store a single element per thread in shared memory.
+    shared_data[thread_idx] = X[thread_idx];
+```
+
+with the following `for` loop:
+
+```c++
+    // Compute the number of elements each thread will process.
+    size_t const num_elements_per_thread{(num_elements_per_batch + NUM_THREADS - 1) / NUM_THREADS};
+    
+    // Initialize the sum variable.
+    float sum{0.0f};
+    
+    for (size_t i = 0; i < num_elements_per_thread; ++i) {
+        size_t const offset{thread_idx + i * NUM_THREADS};
+        if (offset < num_elements_per_batch)
+            sum += X[offset];
+    }
+    shared_data[thread_idx] = sum;
+```
+
+
 Experimenting with varying number of elements per thread using the 128-thread configuration leads to the following result.
 
 | # elements per thread | Runtime (µs) | Mean Effective Bandwidth | % Peak Bandwidth |
@@ -263,3 +289,36 @@ Experimenting with varying number of elements per thread using the 128-thread co
 | 512 | 2,519.89 | 852.225 | 95.11 |
 | 1,024 | 2,524.26 | 850.743 | 94.94 |
 | 2,048 | 2,526.57 | 849.964 | 94.85 |
+
+> 📝 **Note**
+>
+> For the case of adding two elements per thread, running the simple operation `shared_data[thread_idx] = X[thread_idx] + X[thread_idx + NUM_THREADS];`--following the approach of Mark Harris's Kernel 4--instead of using a `for` loop yields effective bandwidth of 848.272 GB/s, which is slightly higher than the value shown in the table (844.339 GB/s). This improvement is likely due to the simplicity of the operation compared to the `for` loop implementation, which involves additional complexity such as using an extra register to store intermediate sums and evaluating an `if` condition within each iteration.
+
+Based on the table above, we observe a significant performance jump: from 52% in the one-element-per-thread configuration to 94% in the two-elements-per-thread configuration! Performance continues to gradually improve as the number of elements per thread increases, peaking when each thread processes 32 or 64 elements.
+
+Additionally, the Nsight Compute profiles show that achieved occupancy increases from 86% in Kernel 2 to 99% in Kernel 4. (Recall that both kernels have a theoretical occupancy of 100%) This improvement is likely due to the significantly lower overhead associated with launching fewer threads in Kernel 4.
+
+*Why are the elements being summed in each thread separated by a stride that is a multiple of the block size?*
+
+Notice that when computing `offset` in the `for` loop, each thread sums elements at indices of the form `thread_idx + <multiple of NUM_THREADS>`. You might wonder why we don't simply sum `n` contiguous elements per thread (where `n` is the number of elements assigned to each thread). As discussed in [Part 0](/_posts/2025-10-14-reduction_sum_part0.markdown), global memory access is relatively slow, so optimizing memory access efficiency is critical.
+
+By introducing a stride (i.e., a gap between the elements each thread accesses), we ensure that **all threads in a warp collectively access contiguous memory locations in each iteration** (see the figure below). This pattern enables the hardware to potentially combine these accesses into a single memory transaction--a process known as **memory coalescing**, which significantly improves memory throughput. 
+
+![image Memory coalescing](/assets/images/2025-10-14-reduction_sum_part1/kernel4_memory_coalesce.png)
+<p style="text-align: center;"><i>A coalesced access pattern in which contiguous memory locations are accessed during each `for` loop iteration.</i></p>
+
+> 💬 **Optional reading**
+>
+> Using an uncoalesced memory access pattern with 32 elements per thread results in an effective memory bandwidth of 775.471 GB/s, compared to 853.208 GB/s with coalesced access.
+
+To summarize, we have the updated performance table below.
+
+
+| Kernel # <br />(128 threads/block) | Runtime (µs) | Mean Effective Bandwidth | % Peak Bandwidth |
+|:---:|:---:|:---:|:---:|
+| kernel 0 | 5,017.23 | 431.366 | 48.14 |
+| kernel 1 | 4,962.33 | 436.138 | 48.67 |
+| kernel 2 | 4,968.31 | 435.613 | 48.61 |
+| kernel 3 | 4,512.13 | 479.654 | 53.53 |
+| 🆕 kernel 4 🆕 | 2,517.57 | 853.208 | 95.22 |
+
