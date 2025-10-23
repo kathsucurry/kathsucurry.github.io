@@ -325,7 +325,7 @@ At this point, we have reached 95% peak bandwidth. Let's see if the rest of the 
 
 # Kernel 5: loop unrolling
 
-Loop unrolling is an optimization technique in which programmers or compilers rewrite a loop as a sequence of repeated, independent statements. The goal is to reduce or eliminate the overhead associated with loop control operations, such as index incrementation and end-of-loop condition checks. You can find more details [here](https://en.wikipedia.org/wiki/Loop_unrolling).
+Loop unrolling is an optimization technique in which developers or compilers rewrite a loop as a sequence of repeated, independent statements. The goal is to reduce or eliminate the overhead associated with loop control operations, such as index incrementation and end-of-loop condition checks. You can find more details [here](https://en.wikipedia.org/wiki/Loop_unrolling).
 
 Mark Harris's presentation provides two kernels that perform loop unrolling: Reduction #5 (Unroll The Last Warp) and Reduction #6 (Competely Unrolled).
 
@@ -338,7 +338,7 @@ Mark Harris's presentation provides two kernels that perform loop unrolling: Red
 
 In this implementation, only the final active warp (i.e., threads with indices < 32) is unrolled by defining and calling a helper function `warp_reduce` where these threads perform the summation without requiring any explicit thread synchronization. This is possible because all threads within a warp execute in **lockstep**, meaning, all active threads follow the same instruction stream simultanouesly, and none can advance ahead or fall behind. Note, however, that this strict lockstep behavior applies primarily to old GPU architectures; we'll discuss the implications of this later when addressing potential issues.
 
-We add 3 modifications to the code:
+To implement the kernel, we add 3 modifications to the code:
 
 1\. Define the helper function `warp_reduce()`.
 
@@ -454,9 +454,9 @@ To disable this automatic unrolling, we can add `#pragma unroll 1` right before 
 ![image Kernel 4 with disabled unrolling](/assets/images/2025-10-14-reduction_sum_part1/kernel5_thread_coarsening.png)
 <p style="text-align: center;"><i>Adding `#pragma unroll 1` disables the automatic unrolling. The PTX code lines highlighted in blue correspond to line 34 in the source code.</i></p>
 
-Given this behavior, we can also expect no additional performance gain when manually completely unrolling the `for` loop in the second version of Kernel 5.
+Given this behavior, we can expect no additional performance gain when manually completely unrolling the `for` loop in the second version of Kernel 5.
 
-There is, however, one noticeable difference between Kernel 4 and Kernel 5 version 1 (which unrolls only the last warp). When we reveal the linked code for the lines under `warp_reduce()` in Kernel 5 version 1, we can see that the following PTX instructions:
+There is, however, one noticeable difference between Kernel 4 and Kernel 5 version 1 (which unrolls only the last warp). When we reveal the linked code for the lines under `warp_reduce()` in Kernel 5 version 1, we can see that the following PTX instructions are repeated contiguously (with different memory addresses and registers), without any of the overhead associated with thread synchronization or conditional checks that are present in Kernel 4's PTX code.
 
 ```
 ld.volatile.shared.f32 	%f28, [%r1];      // Load a register variable %f28 from shared memory with address %r1.
@@ -465,12 +465,19 @@ add.f32                 %f30, %f29, %f28; // Add %f29 and %f28, then store the r
 st.volatile.shared.f32 	[%r1], %f30;      // Store %f30 in shared memory with address %r1.
 ```
 
-are repeated contiguously (with different memory addresses and registers), without any of the overhead associated with thread synchronization or conditional checks that are present in Kernel 4's PTX code.
+The figure below shows the side-by-side PTX instructions comparison between Kernel 4 and Kernel 5 version 1.
 
 ![image Comparing PTX code between Kernel 4 and Kernel 5 (unroll last warp)](/assets/images/2025-10-14-reduction_sum_part1/kernel5_ptx.png)
 <p style="text-align: center;"><i>The main difference between Kernel 4 and Kernel 5 version 1.</i></p>
 
-This may explain the slight effective bandwidth gain between Kernel 4 and Kernel 5.
+This difference might explain the slight bandwidth gain from Kernel 4 to Kernel 5.
 
+### Obsolete assumption
+
+I mentioned earlier in this section that the changes added to Reduction #5 (or Kernel 5 version 1) are now obsolete on newer GPUs. Specifically, the implicit assumption that threads within a warp execute in *strict lockstep* is no longer valid [starting with Volta architecture](https://docs.nvidia.com/cuda/volta-tuning-guide/index.html#sm-independent-thread-scheduling). As a result, the modifications made in Kernel 5 version 1 are no longer reliable and may produce incorrect results. 
+
+Beginning with Volta (Compute Capability ≥ 7.0), NVIDIA introduced **Independent Thread Scheduling**, a feature that gives each thread within a warp the ability to execute independently. This change allows developers to explicitly manage intra-warp synchronization using modern mechanisms such as [warp shuffle intrinsics](https://developer.nvidia.com/blog/using-cuda-warp-level-primitives/) or [cooperative groups](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#cooperative-groups).
+
+We will explore the use of warp shuffle intrinsics in the next kernel implementation.
 
 
