@@ -281,8 +281,8 @@ Experimenting with varying number of elements per thread using the 128-thread co
 | 4 | 2,532.10 | 849.761 | 94.83 |
 | 8 | 2,523.05 | 851.978 | 95.08 |
 | 16 | 2,519.19 | 852.866 | 95.18 |
-| 32 | 2,517.57 | 853.208 | 95.22 |
-| 64 | 2,517.41 | 853.155 | 95.21 |
+| 32 | 2,517.57 | 853.206 | 95.22 |
+| 64 | 2,517.31 | 853.191 | 95.21 |
 | 128 | 2,518.28 | 852.810 | 95.17 |
 | 256 | 2,517.61 | 853.011 | 95.19 |
 | 512 | 2,519.89 | 852.225 | 95.11 |
@@ -334,13 +334,13 @@ Mark Harris's presentation provides two kernels that perform loop unrolling: Red
 > The changes added to Reduction #5 is now obsolete on newer GPUs, which I will discuss further later.
 
 
-**Reduction #5: unroll the last warp**
+**Reduction #5 (Kernel 5 v1): unroll the last warp**
 
-In this implementation, only the final active warp (i.e., threads with indices < 32) is unrolled by defining and calling a helper function `warp_reduce` where these threads perform the summation without requiring any explicit thread synchronization. This is possible because all threads within a warp execute in **lockstep** (with a caveat that it only applies in older GPUs; we'll discuss further when assessing the issues), meaning, all active threads follow the same instruction stream simultanouesly, and none can advance ahead or fall behind.
+In this implementation, only the final active warp (i.e., threads with indices < 32) is unrolled by defining and calling a helper function `warp_reduce` where these threads perform the summation without requiring any explicit thread synchronization. This is possible because all threads within a warp execute in **lockstep**, meaning, all active threads follow the same instruction stream simultanouesly, and none can advance ahead or fall behind. Note, however, that this strict lockstep behavior applies primarily to old GPU architectures; we'll discuss the implications of this later when addressing potential issues.
 
 We add 3 modifications to the code:
 
-1. Define the helper function `warp_reduce()`.
+1\. Define the helper function `warp_reduce()`.
 
 ```c++
 __device__ void warp_reduce(volatile float* shared_data, size_t thread_idx) {
@@ -353,16 +353,16 @@ __device__ void warp_reduce(volatile float* shared_data, size_t thread_idx) {
 }
 ```
 
-2. Modify the `for` loop condition.
+2\. Modify the `for` loop condition.
 
 ```c++
-    // The for loop now ends when stride <= NUM_THREADS_PER_WARP (32) instead of 0.
+    // Replace `stride > 0` with `stride > NUM_THREADS_PER_WARP`.
     for (size_t stride = NUM_THREADS / 2; stride > NUM_THREADS_PER_WARP; stride >>= 1) {
         ...
     }
 ```
 
-3. Call `warp_reduce()` when thread index is less than 32.
+3\. Call `warp_reduce()` when thread index is less than 32.
 
 ```c++
     if (thread_idx < NUM_THREADS_PER_WARP) {
@@ -373,25 +373,40 @@ __device__ void warp_reduce(volatile float* shared_data, size_t thread_idx) {
 
 The `volatile` qualitifer is applied to the `shared_data` variable in `warp_reduce()` to prevent the compiler from optimizing away or caching its values. Since multiple threads may update the same shared memory locations, marking the variable as `volatile` ensures that each thread always reads the most up-to-date value written by other threads, preventing reordering or register caching of shared memory accesses.
 
-**Reduction #6: completely unrolled**
+**Reduction #6 (Kernel 5 v2): completely unrolled**
 
-The maximum number of threads per block is fixed to 1,024 for current GPUs, which makes it possible to completely unroll the `for` loop by adding these modifications to the implementation code:
+The maximum number of threads per block is fixed to 1,024 for current GPUs, which makes it possible to completely unroll the `for` loop since it relies on the number of threads per block. We simply add these modifications to the implementation code:
 
-1. Pass the block size constant using template and add block size `if` condition in `warp_reduce()`.
+1\. Pass the block size constant using template and add `if` condition for each sum operation in `warp_reduce()`.
 
 ```c++
 template <size_t NUM_THREADS>
 __device__ void warp_reduce(volatile float* shared_data, size_t thread_idx) {
     if (NUM_THREADS >= 64) shared_data[thread_idx] += shared_data[thread_idx + 32];
     if (NUM_THREADS >= 32) shared_data[thread_idx] += shared_data[thread_idx + 16];
-    if (NUM_THREADS >= 16) shared_data[thread_idx] += shared_data[thread_idx + 8];
-    if (NUM_THREADS >= 8) shared_data[thread_idx] += shared_data[thread_idx + 4];
-    if (NUM_THREADS >= 4) shared_data[thread_idx] += shared_data[thread_idx + 2];
-    if (NUM_THREADS >= 2) shared_data[thread_idx] += shared_data[thread_idx + 1];
+    if (NUM_THREADS >= 16) shared_data[thread_idx] += shared_data[thread_idx +  8];
+    if (NUM_THREADS >=  8) shared_data[thread_idx] += shared_data[thread_idx +  4];
+    if (NUM_THREADS >=  4) shared_data[thread_idx] += shared_data[thread_idx +  2];
+    if (NUM_THREADS >=  2) shared_data[thread_idx] += shared_data[thread_idx +  1];
 }
 ```
 
-2. Completely unroll the summation `for` loop.
+2\. Completely unroll the summation `for` loop by replacing the follwing:
+
+```c++
+    for (size_t stride = NUM_THREADS / 2; stride > NUM_THREADS_PER_WARP; stride >>= 1) {
+        __syncthreads();
+        if (thread_idx < stride)
+            shared_data[thread_idx] += shared_data[thread_idx + stride];
+    }
+
+    if (thread_idx < NUM_THREADS_PER_WARP) {
+        __syncthreads();
+        warp_reduce(shared_data, thread_idx);
+    }
+```
+
+with:
 
 ```c++
     if (NUM_THREADS == 1024){
@@ -414,4 +429,48 @@ __device__ void warp_reduce(volatile float* shared_data, size_t thread_idx) {
     if (thread_idx < NUM_THREADS_PER_WARP)
         warp_reduce<NUM_THREADS>(shared_data, thread_idx);
 ```
+
+The performance of the two kernels can be found below.
+
+| Kernel # <br />(128 threads/block) | Runtime (µs) | Mean Effective Bandwidth | % Peak Bandwidth |
+|:---:|:---:|:---:|:---:|
+| kernel 4 | 2,517.57 | 853.206 | 95.22 | 
+| kernel 5: unroll last warp | 2,517.51 | 853.226 | 95.22 |
+| kernel 5: completely unrolled | 2,517.56 | 853.212 | 95.22 |
+
+There's only a very slight effective bandwidth improvement from Kernel 4 to Kernel 5, and no additional gain when moving from unrolling only the last warp to fully unrolling the summation `for` loop.
+
+*Why is the performance improvement from Kernel 4 to Kernel 5 so minimal?*
+
+To answer this question, I copied the implementation code of Kernel 4 and both versions of Kernel 5 into [Godbolt](https://godbolt.org/z/cPqhMPPhn).
+
+Focusing first on Kernel 4, we see from the PTX code that the `for` loop has already been **automatically unrolled** by the compiler when inspecting the PTX code (see the figure below). This happens because modern CUDA compilers are capable of automatically unrolling loops--either completely or partially--whenever doing so is expected to improve performance.
+
+![image Kernel 4 already unrolled](/assets/images/2025-10-14-reduction_sum_part1/kernel5_thread_coarsening_unrolled.png)
+<p style="text-align: center;"><i>The compiler has already automatically unrolled the `for` loop in Kernel 4. The PTX code lines highlighted in blue correspond to line 33 in the source code.</i></p>
+
+To disable this automatic unrolling, we can add `#pragma unroll 1` right before the `for` loop and see the differences in the PTX code.
+
+![image Kernel 4 with disabled unrolling](/assets/images/2025-10-14-reduction_sum_part1/kernel5_thread_coarsening.png)
+<p style="text-align: center;"><i>Adding `#pragma unroll 1` disables the automatic unrolling. The PTX code lines highlighted in blue correspond to line 34 in the source code.</i></p>
+
+Given this behavior, we can also expect no additional performance gain when manually completely unrolling the `for` loop in the second version of Kernel 5.
+
+There is, however, one noticeable difference between Kernel 4 and Kernel 5 version 1 (which unrolls only the last warp). When we reveal the linked code for the lines under `warp_reduce()` in Kernel 5 version 1, we can see that the following PTX instructions:
+
+```
+ld.volatile.shared.f32 	%f28, [%r1];      // Load a register variable %f28 from shared memory with address %r1.
+ld.volatile.shared.f32 	%f29, [%r1+128];  // Load a register variable %f29 from shared memory with address $r1+128.
+add.f32                 %f30, %f29, %f28; // Add %f29 and %f28, then store the result in %f30.
+st.volatile.shared.f32 	[%r1], %f30;      // Store %f30 in shared memory with address %r1.
+```
+
+are repeated contiguously (with different memory addresses and registers), without any of the overhead associated with thread synchronization or conditional checks that are present in Kernel 4's PTX code.
+
+![image Comparing PTX code between Kernel 4 and Kernel 5 (unroll last warp)](/assets/images/2025-10-14-reduction_sum_part1/kernel5_ptx.png)
+<p style="text-align: center;"><i>The main difference between Kernel 4 and Kernel 5 version 1.</i></p>
+
+This may explain the slight effective bandwidth gain between Kernel 4 and Kernel 5.
+
+
 
