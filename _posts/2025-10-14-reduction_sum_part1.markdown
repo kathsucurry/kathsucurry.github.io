@@ -243,7 +243,7 @@ which gives us a better performance as shown below.
 
 Recall in all the kernels so far, after loading elements from global memory into shared memory, half of the threads (`N / 2`) become idle at the start of the `for` loop. In the second iteration, `N / 4` threads become idle, then `N / 8` in the third, and so on, until only one thread remains active in the final iteration. This progressive underutilization of resources, exacerbated by the attempt to maximize parallelism (i.e., launching as many threads as possible), can significantly impact performance.
 
-One fundamental optimization technique to address this issue is **thread coarsening**. The idea is to have each thread perform more work, thereby reducing the total number of threads launched and minimizing parallelization overhead. In this context, I'm merging Mark Harris's Kernel 4 and Kernel 7, and will experiment with varying the number of elements each thread loads and adds. The implementation is illustrated by the figure below.
+One fundamental optimization technique to address this issue is **thread coarsening**. The idea is to have each thread perform more work, thereby reducing the total number of threads launched and minimizing parallelization overhead. In this context, I'm merging Mark Harris's Reduction #4 (First Add During Load) and Reduction #7 (Multiple Adds Per Thread), and will experiment with varying the number of elements each thread loads and adds. The implementation is illustrated by the figure below.
 
 ![image Thread coarsening](/assets/images/2025-10-14-reduction_sum_part1/kernel4_thread_coarsening.png)
 <p style="text-align: center;"><i>The thread coarsening kernel where the number of elements per thread is set to 3.</i></p>
@@ -271,7 +271,6 @@ with the following `for` loop:
     }
     shared_data[thread_idx] = sum;
 ```
-
 
 Experimenting with varying number of elements per thread using the 128-thread configuration leads to the following result.
 
@@ -309,7 +308,7 @@ By introducing a stride (i.e., a gap between the elements each thread accesses),
 
 > 💬 **Optional reading**
 >
-> Using an uncoalesced memory access pattern with 32 elements per thread results in an effective memory bandwidth of 775.471 GB/s, compared to 853.208 GB/s with coalesced access.
+> Using an uncoalesced memory access pattern with 32 elements per thread results in an effective memory bandwidth of 776.987 GB/s, compared to 853.208 GB/s with coalesced access.
 
 To summarize, we have the updated performance table below.
 
@@ -321,4 +320,98 @@ To summarize, we have the updated performance table below.
 | kernel 2 | 4,968.31 | 435.613 | 48.61 |
 | kernel 3 | 4,512.13 | 479.654 | 53.53 |
 | 🆕 kernel 4 🆕 | 2,517.57 | 853.208 | 95.22 |
+
+At this point, we have reached 95% peak bandwidth. Let's see if the rest of the kernels in Mark Harris's presentation can improve it even further.
+
+# Kernel 5: loop unrolling
+
+Loop unrolling is an optimization technique in which programmers or compilers rewrite a loop as a sequence of repeated, independent statements. The goal is to reduce or eliminate the overhead associated with loop control operations, such as index incrementation and end-of-loop condition checks. You can find more details [here](https://en.wikipedia.org/wiki/Loop_unrolling).
+
+Mark Harris's presentation provides two kernels that perform loop unrolling: Reduction #5 (Unroll The Last Warp) and Reduction #6 (Competely Unrolled).
+
+> ⚠️ **Caution** ⚠️
+>
+> The changes added to Reduction #5 is now obsolete on newer GPUs, which I will discuss further later.
+
+
+**Reduction #5: unroll the last warp**
+
+In this implementation, only the final active warp (i.e., threads with indices < 32) is unrolled by defining and calling a helper function `warp_reduce` where these threads perform the summation without requiring any explicit thread synchronization. This is possible because all threads within a warp execute in **lockstep** (with a caveat that it only applies in older GPUs; we'll discuss further when assessing the issues), meaning, all active threads follow the same instruction stream simultanouesly, and none can advance ahead or fall behind.
+
+We add 3 modifications to the code:
+
+1. Define the helper function `warp_reduce()`.
+
+```c++
+__device__ void warp_reduce(volatile float* shared_data, size_t thread_idx) {
+    shared_data[thread_idx] += shared_data[thread_idx + 32];
+    shared_data[thread_idx] += shared_data[thread_idx + 16];
+    shared_data[thread_idx] += shared_data[thread_idx + 8];
+    shared_data[thread_idx] += shared_data[thread_idx + 4];
+    shared_data[thread_idx] += shared_data[thread_idx + 2];
+    shared_data[thread_idx] += shared_data[thread_idx + 1];
+}
+```
+
+2. Modify the `for` loop condition.
+
+```c++
+    // The for loop now ends when stride <= NUM_THREADS_PER_WARP (32) instead of 0.
+    for (size_t stride = NUM_THREADS / 2; stride > NUM_THREADS_PER_WARP; stride >>= 1) {
+        ...
+    }
+```
+
+3. Call `warp_reduce()` when thread index is less than 32.
+
+```c++
+    if (thread_idx < NUM_THREADS_PER_WARP) {
+        __syncthreads();
+        warp_reduce(shared_data, thread_idx);
+    }
+```
+
+The `volatile` qualitifer is applied to the `shared_data` variable in `warp_reduce()` to prevent the compiler from optimizing away or caching its values. Since multiple threads may update the same shared memory locations, marking the variable as `volatile` ensures that each thread always reads the most up-to-date value written by other threads, preventing reordering or register caching of shared memory accesses.
+
+**Reduction #6: completely unrolled**
+
+The maximum number of threads per block is fixed to 1,024 for current GPUs, which makes it possible to completely unroll the `for` loop by adding these modifications to the implementation code:
+
+1. Pass the block size constant using template and add block size `if` condition in `warp_reduce()`.
+
+```c++
+template <size_t NUM_THREADS>
+__device__ void warp_reduce(volatile float* shared_data, size_t thread_idx) {
+    if (NUM_THREADS >= 64) shared_data[thread_idx] += shared_data[thread_idx + 32];
+    if (NUM_THREADS >= 32) shared_data[thread_idx] += shared_data[thread_idx + 16];
+    if (NUM_THREADS >= 16) shared_data[thread_idx] += shared_data[thread_idx + 8];
+    if (NUM_THREADS >= 8) shared_data[thread_idx] += shared_data[thread_idx + 4];
+    if (NUM_THREADS >= 4) shared_data[thread_idx] += shared_data[thread_idx + 2];
+    if (NUM_THREADS >= 2) shared_data[thread_idx] += shared_data[thread_idx + 1];
+}
+```
+
+2. Completely unroll the summation `for` loop.
+
+```c++
+    if (NUM_THREADS == 1024){
+        if (thread_idx < 512) shared_data[thread_idx] += shared_data[thread_idx + 512];
+        __syncthreads();
+    }
+    if (NUM_THREADS >= 512){
+        if (thread_idx < 256) shared_data[thread_idx] += shared_data[thread_idx + 256];
+        __syncthreads();
+    }
+    if (NUM_THREADS >= 256){
+        if (thread_idx < 128) shared_data[thread_idx] += shared_data[thread_idx + 128];
+        __syncthreads();
+    }
+    if (NUM_THREADS >= 128){
+        if (thread_idx < 64) shared_data[thread_idx] += shared_data[thread_idx + 64];
+        __syncthreads();
+    }
+
+    if (thread_idx < NUM_THREADS_PER_WARP)
+        warp_reduce<NUM_THREADS>(shared_data, thread_idx);
+```
 
