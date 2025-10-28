@@ -103,7 +103,7 @@ Unlike global memory, which is located in the GPU's off-chip DRAM, shared memory
 > ["How CUDA Programming Works" presentation by Stephen Jones](https://www.nvidia.com/en-us/on-demand/session/gtcfall22-a41101/) provides a really good explanation of how the resources required by each thread block--such as shared memory-- affect the number of blocks that can be scheduled on each SM. The slide below, taken from the presentation, illustrates an example of this.
 
 >
-> ![image How the GPU places blocks on an SM](/assets/images/2025-10-14-reduction_sum_part1/fig0_sm_allocation.png)
+> ![image How the GPU places blocks on an SM](/assets/images/2025-10-27-reduction_sum_part1/fig0_sm_allocation.png)
 >
 > Given the block resource requirements (shown in the table at the bottom left), we can see that the GPU is unable to place **Block 3** due to the insufficient remaining shared memory. Since 3 blocks have already been placed (`3 * 48 kB = 144 kB`), only `160 kB - 144 kB = 16 kB` of shared memory remains, which is insufficient for another block that requires `48 kB`.
 
@@ -172,4 +172,4 @@ The definition of all element classes can be found in [`elements.h` file](https:
 
 <br />
 
-With the basics covered, we are now ready to implement and optimize the sum reduction algorithm! Click [here]({% link _posts/2025-10-14-reduction_sum_part1.markdown %}) to continue to the next part of the series.
+With the basics covered, we are now ready to implement and optimize the sum reduction algorithm! Click [here]({% link _posts/2025-10-27-reduction_sum_part1.markdown %}) to continue to the next part of the series.
