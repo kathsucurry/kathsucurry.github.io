@@ -651,18 +651,23 @@ This kernel shows a slight improvement compared to Kernel 6:
 
 # Summary
 
+In this series, we take a deep dive into sum reduction: how it works, how to implement the kernel, and how to further optimize it. My approach builds on Mark Harris's original presentation, which I adapt to take advantage of modern hardware, smarter compilers, and the more recent GPU features.
+
+With these optimizations, our kernel hits an effective memory bandwidth of 842.22 GB/s, which is about 94% of the GPU's peak!
+
+Running the different kernels (excluding the now-deprecated Kernel 5) across various data sizes gives us the following plot. As we can see, Kernel 4 (thread coarsening) stands out with a significant performance boost.
+
+![image Performance of all kernels](/assets/images/2025-10-27-reduction_sum_part1/summary.png)
+<p style="text-align: center;"><i>The performance of all kernels across various data sizes.</i></p>
 
 
 # Resources
 
-https://developer.nvidia.com/blog/faster-parallel-reductions-kepler/
-https://developer.nvidia.com/blog/cuda-pro-tip-kepler-shuffle/ 
-https://developer.nvidia.com/blog/using-cuda-warp-level-primitives/ 
-
-
-
-
-
-
-
+- [Optimizing Parallel Reduction in CUDA](https://developer.download.nvidia.com/assets/cuda/files/reduction.pdf) by Mark Harris (2007)
+- [CUDA Reduction](https://leimao.github.io/blog/CUDA-Reduction/) by Lei Mao (2024)
+- [Faster Parallel Reductions on Kepler](https://developer.nvidia.com/blog/faster-parallel-reductions-kepler/) by Justin Luitjens (2014)
+- [CUDA Pro Tip: Do The Kepler Shuffler](https://developer.nvidia.com/blog/cuda-pro-tip-kepler-shuffle/) by Mark Harris (2014)
+- [Using CUDA Warp-Level Primitives](https://developer.nvidia.com/blog/using-cuda-warp-level-primitives/) by Yuan Lin and Vinod Grover (2018)
+- Illustrations were made with [Excalidraw](https://excalidraw.com/)
+- The xkcd-style final plot was generated using [matplotlib](https://matplotlib.org/stable/api/_as_gen/matplotlib.pyplot.xkcd.html)
 
