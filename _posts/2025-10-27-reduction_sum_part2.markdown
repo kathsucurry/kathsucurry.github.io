@@ -1,26 +1,29 @@
 ---
 layout: post
-title:  "Reduction (Sum): part 1"
+title:  "Reduction (Sum): part 2"
 date:   2025-10-27
 categories: cuda
 ---
 
-As part of the "Reduction (Sum)" series, this post outlines my process and approach to implementing and optimizing sum reduction kernels. I use Mark Harris's [*Optimizing Parallel Reduction in CUDA* deck](https://developer.download.nvidia.com/assets/cuda/files/reduction.pdf) as a reference, with modifications based on the insights I've gained along the way. My approach can be summarized as follows.
+As part of the "Reduction (Sum)" series, this post outlines my process and approach to implementing and optimizing sum reduction kernels. I use Mark Harris's [*Optimizing Parallel Reduction in CUDA* deck](https://developer.download.nvidia.com/assets/cuda/files/reduction.pdf) and Lei Mao's [*CUDA Reduction* code](https://leimao.github.io/blog/CUDA-Reduction/) as references, with modifications based on the insights I've gained along the way. My approach can be summarized as follows.
 
-1. **Implement the reduction kernel** and ensure that the output is correct using the verification process described in the [previous post]({% link _posts/2025-10-14-reduction_sum_part0.markdown %}).
+1. **Implement the reduction kernel** and ensure that the output is correct using the verification process described in the [previous post]({% link _posts/2025-10-14-reduction_sum_part1.markdown %}).
 2. **Analyze the kernel's performance** to understand whether (and why) it performs better or worse. Some methods include:
     -  **Profile the kernel** using [NVIDIA Nsight Compute](https://developer.nvidia.com/nsight-compute). I highly recommend you to watch [this kernel profiling lecture](https://www.youtube.com/watch?v=F_BazucyCMw&t=1s) hosted by GPU Mode if you are interested in using Nsight Compute.
-    - **Inspect the PTX/SASS**, if necessary, to better understand the performance characteristics or identify optimization opportunities.
+    - **Inspect the PTX/SASS**, if necessary, to better understand the performance characteristics or identify optimization opportunities. I use [Godbolt](https://godbolt.org/) for convenient viewing and easy sharing.
+
+Note that in this post, the terms *batch* and *block* are used interchangeably and will be treated as identical.
 
 
 # Kernel 0: naive interleaved addressing
 
-The figure below summarizes the kernel implementation.
+This kernel follows closely the tree-based approach illustrated in the [previous post]({% link _posts/2025-10-14-reduction_sum_part1.markdown %}). The implementation is summarized in the illustration below.
 
-![image Naive interleaved addressing](/assets/images/2025-10-27-reduction_sum_part1/kernel0_interleaved_address.png)
-<p style="text-align: center;"><i>The first interleaved addressing kernel by Mark Harris.</i></p>
+![image Naive interleaved addressing](/assets/images/2025-10-27-reduction_sum_part2/kernel0_interleaved_address.png)
+<p style="text-align: center;"><i>The first interleaved addressing kernel from Mark Harris's presentation.</i></p>
 
-And you can find the relevant code below. Note the identical and interchangeable definition of the terms *batch* and *block* in this post.
+The kernel function can be written as follows.
+
 
 ```c++
 template <size_t NUM_THREADS>
@@ -51,20 +54,20 @@ __global__ void batched_interleaved_address_naive(
 }
 ```
 
-Recall from the previous post that my GPU (RTX 5070 Ti) peak bandwidth is 896 GB/s and there are `2048 * 1024 * 256` number of elements. Running the kernel 50 times repeatedly with different numbers of threads per block leads to the following performance table. 
+Recall from the previous post that my GPU (RTX 5070 Ti) peak bandwidth is 896 GB/s and there are 2<sup>29</sup> number of elements. Running the kernel 50 times repeatedly with different numbers of threads per block leads to the following performance table. 
 
-| # Threads/block | Runtime (µs) | Mean Effective Bandwidth | % Peak Bandwidth |
+| # Threads/block | Mean Effective Bandwidth | % Peak Bandwidth |
 |:---:|:---:|:---:|:---:|
-| 128 | 5,017.23 | 431.366 | 48.14 |
-| 256 | 5,098.87 | 423.229 | 47.23 |
-| 512 | 5,652.35 | 380.67 | 42.48 |
-| 1,024 | 10,193.5 | 210.878 | 23.53 |
+| 128 | 431.03 | 48.10 |
+| 256 | 422.58 | 47.16 |
+| 512 | 381.34 | 42.56 |
+| 1,024 | 212.07 | 23.67 |
 
-We observe that using 128 threads yields the best performance among all the options. Increasing the number of threads to 256 slightly degrades performance; using 512 threads reduces it further, and with 1,024 threads, performance drops significantly--the achieved bandwidth is nearly half that of the 128-thread configuration.
+We observe that using 128 threads yields the best performance among all the options. Increasing the number of threads to 256 slightly degrades performance; using 512 threads reduces it further, and with 1,024 threads, performance drops significantly--the achieved bandwidth is approximately half that of the 128-thread configuration.
 
 *What explains the performance differences across thread configurations?*
 
-Let's start with the 1,024-thread configuration. In the previous post, we briefly discussed how the resources required by each block can limit the number of blocks that can be scheduled in each multiprocessor. These resources include the number of threads, the number of registers, and the amount of shared memory required per block.
+Let's start with the 1,024-thread configuration. The previous post briefly touched upon how the resources required by each block can limit the number of blocks that can be scheduled in each multiprocessor. These resources include the number of threads, the number of registers, and the amount of shared memory required per block.
 
 The maximum threads per multiprocessor on my GPU is 1,536 (equivalent to 48 warps), as reported by the `maxThreadsPerMultiProcessor` field from `cudaGetDeviceProperties`. With a block size of 1,024, the GPU can only place 1 block (i.e., 32 warps) per SM. This means that out of the 48 warps slots available on the SM, only 32 are active, resulting in a theoretical occupancy of `32 / 48 * 100% = 66.67%`. In contrast, the other thread configurations are able to achieve 100% theoretical occupancy.
 
@@ -74,18 +77,20 @@ As mentioned earlier, the number of registers and the amount of shared memory pe
 
 Looking at the profile generated by Nsight Compute, all three thread configurations exhibit thread divergence.
 
-![image Thread Divergence](/assets/images/2025-10-27-reduction_sum_part1/kernel0_thread_divergence.png)
-<p style="text-align: center;"><i>One of the suggestions from Nsight Compute for the 128-thread configuration, which is to address the thread divergence issue.</i></p>
+![image Thread Divergence](/assets/images/2025-10-27-reduction_sum_part2/kernel0_thread_divergence.png)
+<p style="text-align: center;"><i>One of the suggested improvement opportunities from Nsight Compute, which is to address the thread divergence issue.</i></p>
 
-In our case, thread divergence occurs because the threads performing the sum operation in the `for` loop (i.e., the active threads whose indices satisfy the `if` condition) are scattered across multiple warps. In the 128-thread configuration, there are 64 active threads during the first iteration, but these threads are not grouped contiguously. The active threads consist of those with indices 0, 2, 4, 6, and so on. As a result, all 4 warps are partially active and must execute the loop body, leading to warp divergence. In ideal scenario, only 2 warps would be fully active and the remaining warps inactive, minimizing divergence. **Larger thread blocks can be more negatively affected by thread divergence since more warps increase the opportunity for divergence**, which may help explain why the runtime worsens as the number of threads per block increases from 128 to 256 and 512.
+In our case, thread divergence occurs because the threads performing the sum operation in the `for` loop (i.e., the active threads whose indices satisfy the `if` condition) are **scattered across multiple warps**. In the 128-thread configuration, there are 64 active threads during the first iteration, but these threads are not grouped contiguously. The active threads consist of those with indices 0, 2, 4, 6, and so on. As a result, all 4 warps are partially active and must execute the loop body, leading to warp divergence. In ideal scenario, only 2 warps would be fully active and the remaining warps inactive, minimizing divergence.
 
-Note that we will only use the 128-thread configuration for all the subsequent implementations.
+**Larger thread blocks can be more negatively affected by thread divergence since more warps increase the opportunity for divergence**, which may help explain why the runtime worsens as the number of threads per block increases from 128 to 256 and 512.
+
+We will only use the 128-thread configuration for all the subsequent implementations.
 
 # Kernel 1: interleaved addressing with thread divergence resolved
 
-The only difference between Kernel 0 and Kernel 1 lies in how we select the active threads--i.e., the threads that perform the sum operation. The goal is to ensure that the active threads are **contiguous** such that only `ceil(# active threads / 32)` warp(s) are active. The figure below summarizes the implementation.
+The only difference between Kernel 0 and Kernel 1 lies in how we select the active threads--i.e., the threads that perform the sum operation. The goal is to ensure that the active threads are **contiguous** such that only `ceil(# active threads / 32)` warp(s) are active. The figure below summarizes the implementation, with the global memory loading step omitted for brevity.
 
-![image Interleaved addressing with thread divergence resolved](/assets/images/2025-10-27-reduction_sum_part1/kernel1_interleaved_address.png)
+![image Interleaved addressing with thread divergence resolved](/assets/images/2025-10-27-reduction_sum_part2/kernel1_interleaved_address.png)
 <p style="text-align: center;"><i>The interleaved addressing kernel with thread divergence resolved.</i></p>
 
 As for the code, we only need to change the following:
@@ -112,50 +117,49 @@ to:
 
 Below is the updated performance table.
 
-| Kernel # <br />(128 threads/block) | Runtime (µs) | Mean Effective Bandwidth | % Peak Bandwidth |
+| Kernel # <br />(128 threads/block) | Mean Effective Bandwidth | % Peak Bandwidth |
 |:---:|:---:|:---:|:---:|
-| kernel 0 | 5,017.23 | 431.366 | 48.14 |
-| 🆕 kernel 1 🆕 | 4,962.33 | 436.138 | 48.67 |
+| kernel 0 | 431.03 | 48.10 |
+| 🆕 kernel 1 🆕 | 434.87 | 48.53 |
 
-There is a slight improvement from Kernel 0 to Kernel 1, although it's not particularly significant. 
+There is a tiny improvement from Kernel 0 to Kernel 1, although it's not particularly significant. 
 
 When profiling the kernel with Nsight Compute, we identify a new performance optimization opportunity: addressing *Shared Load Bank Conflicts*.
 
-
-![image Bank conflicts](/assets/images/2025-10-27-reduction_sum_part1/kernel1_bank_conflict.png)
+![image Bank conflicts](/assets/images/2025-10-27-reduction_sum_part2/kernel1_bank_conflict.png)
 <p style="text-align: center;"><i>A new optimization opportunity observed on Nsight Compute: addressing bank conflicts.</i></p>
 
 *What are shared load (or shared memory) bank conflicts, and why does Kernel 1 have this issue?*
 
-To answer this question, we need to examine how shared memory is organized. According to [CUDA C Programming Guide](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#shared-memory-12-0), for devices with compute capability 12.0 (such as the RTX 5070 Ti), shared memory is divided into **32 banks** or memory modules. **This organization allows simultaneous access to `n` distinct addresses as long as they map to `n` *different* memory banks**. Successive 32-bit words are mapped to successive banks, and each bank provides a bandwidth of 32 bits per clock cycle. A shared memory block containing 128 floating-point elements is organized as illustrated by the figure below.
+To answer this question, we need to examine how shared memory is organized. According to [CUDA C++ Programming Guide](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#shared-memory-12-0), for devices with compute capability 12.0 (such as the RTX 5070 Ti), shared memory is divided into **32 banks** or memory modules. **This organization allows simultaneous access to `n` distinct addresses as long as they map to `n` *different* memory banks**. Successive 32-bit words are mapped to successive banks, and each bank provides a bandwidth of 32 bits per clock cycle. A shared memory block containing 128 4-byte floating-point elements is organized as illustrated by the figure below.
 
-![image Shared memory banks](/assets/images/2025-10-27-reduction_sum_part1/kernel1_banks.png)
+![image Shared memory banks](/assets/images/2025-10-27-reduction_sum_part2/kernel1_banks.png)
 <p style="text-align: center;"><i>How the 128 elements are divided into 32 banks in the shared memory.</i></p>
 
-One or more **bank conflicts** occur when multiple threads in the same warp request *different memory addresses* that are mapped to the same memory bank. These accesses are then serialized, which consequently reduces the effective bandwidth by a factor equal to the number of the memory requests targeting that bank.
+One or more **bank conflicts** occur when multiple threads in the **same warp** request *different memory addresses* that are mapped to the **same memory bank**. These accesses are then serialized, which consequently reduces the effective bandwidth by a factor equal to the number of the memory requests targeting that bank.
 
 In Kernel 0, no bank conflicts occur because threads within the same warp always request addresses that are mapped to different banks. The figure below illustrates the read memory requests by threads in warp 0 (thread index 0 to 31) during the first two iterations of the `for` loop. In iteration 0 (`stride = 1`), thread 0 requests shared memory elements at indices 0 and 1 (located in bank 0 and 1, respectively), thread index 2 requests elements at index 2 and 3 (located in bank 2 and 3), and so on. The same pattern remains consistent across subsequent iterations and for all other warps.
 
-![image Memory requests in Kernel 0](/assets/images/2025-10-27-reduction_sum_part1/kernel1_kernel0_requests.png)
+![image Memory requests in Kernel 0](/assets/images/2025-10-27-reduction_sum_part2/kernel1_kernel0_requests.png)
 <p style="text-align: center;"><i>The memory requests by warp 0 threads in Kernel 0 during the first two iterations</i></p>
 
 In contrast, since the threads performing memory access are grouped into a contiguous block in Kernel 1, bank conflicts occur consistently in all iterations. The figure below illustrates the read memory accesses during the first two iterations, where a **2-way bank conflicts** occur in the first iteration and **4-way bank conflicts** occur in the second iteration. This behavior can significantly reduce the overall effective bandwidth.
 
-![image Memory requests in Kernel 1](/assets/images/2025-10-27-reduction_sum_part1/kernel1_kernel1_requests.png)
+![image Memory requests in Kernel 1](/assets/images/2025-10-27-reduction_sum_part2/kernel1_kernel1_requests.png)
 <p style="text-align: center;"><i>The memory requests by warp 0 threads in Kernel 1 during the first two iterations. Bank conflicts occur in both iterations.</i></p>
 
 In summary, although Kernel 1 resolves the thread divergence issue present in Kernel 0, the shared memory bank conflict issue still needs to be addressed.
 
 > 📝 **Note**
 >
-> A bank conflict does not occur when multiple threads within the same warp access any address within the same 32-bit word. In the case of 4-byte floating-point elements (i.e., 32 bits), bank conflicts do not occur when multiple threads access the *same* address. For read operations, the requested element is broadcast to the requesting threads, while for write operations, each address is written by one of the threads. More details can be found in [CUDA C Programming Guide](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#shared-memory-5-x).
+> A bank conflict does not occur when multiple threads within the same warp access any address **within the same 32-bit word**. In the case of 4-byte floating-point elements (i.e., 32 bits), bank conflicts do not occur when multiple threads access the *same* address. For read operations, the requested element is broadcast to the requesting threads, while for write operations, each address is written by one of the threads. More details can be found in [CUDA C++ Programming Guide](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#shared-memory-5-x).
 
 
 # Kernel 2: sequential addressing
 
 The next implementation addresses the shared memory bank conflict issue observed in Kernel 1 by storing the intermediate sum values in **sequential shared memory addresses**. The following figure illustrates the updated approach.
 
-![image Sequential addressing](/assets/images/2025-10-27-reduction_sum_part1/kernel2_sequential_address.png)
+![image Sequential addressing](/assets/images/2025-10-27-reduction_sum_part2/kernel2_sequential_address.png)
 <p style="text-align: center;"><i>The sequential addressing kernel.</i></p>
 
 In the code, we simply change the following rows from Kernel 1:
@@ -182,11 +186,11 @@ to:
 
 Interestingly, **we don't observe any speedup between Kernel 1 and Kernel 2**, which contrasts with nearly 2x performance improvement reported in Mark Harris's presentation.
 
-| Kernel # <br />(128 threads/block) | Runtime (µs) | Mean Effective Bandwidth | % Peak Bandwidth |
+| Kernel # <br />(128 threads/block) | Mean Effective Bandwidth | % Peak Bandwidth |
 |:---:|:---:|:---:|:---:|
-| kernel 0 | 5,017.23 | 431.366 | 48.14 |
-| kernel 1 | 4,962.33 | 436.138 | 48.67 |
-| 🆕 kernel 2 🆕 | 4,968.31 | 435.613 | 48.61 |
+| kernel 0 | 431.03 | 48.10 |
+| kernel 1 | 434.87 | 48.53 |
+| 🆕 kernel 2 🆕 | 434.73 | 48.51 |
 
 *What accounts for the discrepancy between the performance differences observed in this post and those reported in Mark Harris's presentation?*
 
@@ -194,11 +198,11 @@ One possible explanation is **the improved shared memory performance under bank 
 
 # Kernel 3: repositioning `__syncthreads()`
 
-Kernel 2 includes two thread synchronizations: (1) after loading elements from global memory to shared memory, and 2) at the end of each `for` loop iteration to ensure all thread updates to shared memory are completed. We can further simplify this by **removing one synchronization and repositioning the other to the beginning of the `for` loop**.
+Kernel 2 includes two thread synchronizations: (1) after loading elements from global memory to shared memory, and 2) at the end of each `for` loop iteration to ensure all thread updates to shared memory are completed. We can further simplify this by **removing one synchronization and repositioning the other to the *beginning* of the `for` loop**.
 
 By synchronizing threads at the **start** of the loop, we ensure that the initial shared memory load from global memory is complete before any computation begins. The only synchronization removed is the **final one**, which would have occurred at the end of the **last** iteration: when only a single thread updates the first shared memory element.
 
-This removal is safe because the same thread that performs the final update is also responsible for writing the result back to global memory after the loop ends. Since no other threads are involved at this point, **no synchronization is necessary**.
+This removal is safe because the same thread that performs the final update is also responsible for writing the result back to global memory after the loop ends. Since no other threads are involved at this point, no synchronization is necessary.
 
 To summarize, we change the following code:
 
@@ -229,12 +233,12 @@ to
 
 which gives us a better performance as shown below.
 
-| Kernel # <br />(128 threads/block) | Runtime (µs) | Mean Effective Bandwidth | % Peak Bandwidth |
+| Kernel # <br />(128 threads/block) | Mean Effective Bandwidth | % Peak Bandwidth |
 |:---:|:---:|:---:|:---:|
-| kernel 0 | 5,017.23 | 431.366 | 48.14 |
-| kernel 1 | 4,962.33 | 436.138 | 48.67 |
-| kernel 2 | 4,968.31 | 435.613 | 48.61 |
-| 🆕 kernel 3 🆕 | 4,512.13 | 479.654 | 53.53 |
+| kernel 0 | 431.03 | 48.10 |
+| kernel 1 | 434.87 | 48.53 |
+| kernel 2 | 434.73 | 48.51 |
+| 🆕 kernel 3 🆕 | 479.68 | 53.53 |
 
 
 # Kernel 4: thread coarsening
@@ -243,7 +247,7 @@ Recall in all the kernels so far, after loading elements from global memory into
 
 One fundamental optimization technique to address this issue is **thread coarsening**. The idea is to have each thread perform more work, thereby reducing the total number of threads launched and minimizing parallelization overhead. In this context, I'm merging Mark Harris's Reduction #4 (First Add During Load) and Reduction #7 (Multiple Adds Per Thread), and will experiment with varying the number of elements each thread loads and adds. The implementation is illustrated by the figure below.
 
-![image Thread coarsening](/assets/images/2025-10-27-reduction_sum_part1/kernel4_thread_coarsening.png)
+![image Thread coarsening](/assets/images/2025-10-27-reduction_sum_part2/kernel4_thread_coarsening.png)
 <p style="text-align: center;"><i>The thread coarsening kernel where the number of elements per thread is set to 3.</i></p>
 
 In the implementation code, we replace the code line that stores an element from global memory to shared memory:
@@ -272,54 +276,52 @@ with the following `for` loop:
 
 Experimenting with varying number of elements per thread using the 128-thread configuration leads to the following result.
 
-| # elements per thread | Runtime (µs) | Mean Effective Bandwidth | % Peak Bandwidth |
+| # elements per thread | Mean Effective Bandwidth | % Peak Bandwidth |
 |:---:|:---:|:---:|:---:|
-| 1 | 4,643.64 | 466.070 | 52.01 |
-| 2 | 2,553.32 | 844.339 | 94.23 |
-| 4 | 2,532.10 | 849.761 | 94.83 |
-| 8 | 2,523.05 | 851.978 | 95.08 |
-| 16 | 2,519.19 | 852.866 | 95.18 |
-| 32 | 2,517.57 | 853.206 | 95.22 |
-| 64 | 2,517.31 | 853.191 | 95.21 |
-| 128 | 2,518.28 | 852.810 | 95.17 |
-| 256 | 2,517.61 | 853.011 | 95.19 |
-| 512 | 2,519.89 | 852.225 | 95.11 |
-| 1,024 | 2,524.26 | 850.743 | 94.94 |
-| 2,048 | 2,526.57 | 849.964 | 94.85 |
+| 1 | 466.94 | 52.11 |
+| 2 | 834.00 | 93.07 |
+| 4 | 840.04 | 93.75 |
+| 8 | 841.28 | 93.89 |
+| 16 | 841.76 | 93.94 |
+| 32 | 842.07 | 93.97 |
+| 64 | 841.94 | 93.96 |
+| 128 | 841.39 | 93.90 |
+| 256 | 841.40 | 93.90 |
+| 512 | 840.24 | 93.77 |
 
 > 📝 **Note**
 >
-> For the case of adding two elements per thread, running the simple operation `shared_data[thread_idx] = X[thread_idx] + X[thread_idx + NUM_THREADS];`--following the approach of Mark Harris's Kernel 4--instead of using a `for` loop yields effective bandwidth of 848.272 GB/s, which is slightly higher than the value shown in the table (844.339 GB/s). This improvement is likely due to the simplicity of the operation compared to the `for` loop implementation, which involves additional complexity such as using an extra register to store intermediate sums and evaluating an `if` condition within each iteration.
+> For the case of adding two elements per thread, running the simple operation `shared_data[thread_idx] = X[thread_idx] + X[thread_idx + NUM_THREADS];`--following the approach of Mark Harris's Kernel 4--instead of using a `for` loop yields effective bandwidth of 837.93 GB/s, which is slightly higher than the value shown in the table (834.00 GB/s). This improvement is likely due to the simplicity of the operation compared to the `for` loop implementation, which involves additional complexity such as using an extra register to store intermediate sums and evaluating an `if` condition within each iteration.
 
-Based on the table above, we observe a significant performance jump: from 52% in the one-element-per-thread configuration to 94% in the two-elements-per-thread configuration! Performance continues to gradually improve as the number of elements per thread increases, peaking when each thread processes 32 or 64 elements.
+Based on the table above, we observe a significant performance jump: from 52% in the one-element-per-thread configuration to 93% in the two-elements-per-thread configuration! Performance continues to gradually improve as the number of elements per thread increases, peaking when each thread processes 32 or 64 elements.
 
-Additionally, the Nsight Compute profiles show that achieved occupancy increases from 86% in Kernel 2 to 99% in Kernel 4. (Recall that both kernels have a theoretical occupancy of 100%) This improvement is likely due to the significantly lower overhead associated with launching fewer threads in Kernel 4.
+Additionally, the Nsight Compute profiles show that achieved occupancy increases from 86% in Kernel 2 to 99% in Kernel 4. (Recall that both kernels have a theoretical occupancy of 100%). This improvement is likely due to the significantly lower overhead associated with launching fewer threads and the overall better utilization of resources in Kernel 4.
 
 *Why are the elements being summed in each thread separated by a stride that is a multiple of the block size?*
 
-Notice that when computing `offset` in the `for` loop, each thread sums elements at indices of the form `thread_idx + <multiple of NUM_THREADS>`. You might wonder why we don't simply sum `n` contiguous elements per thread (where `n` is the number of elements assigned to each thread). As discussed in [Part 0](/_posts/2025-10-14-reduction_sum_part0.markdown), global memory access is relatively slow, so optimizing memory access efficiency is critical.
+Notice that when computing `offset` in the `for` loop, each thread sums elements at indices of the form `thread_idx + <multiple of NUM_THREADS>`. You might wonder why we don't simply sum `n` contiguous elements per thread (where `n` is the number of elements assigned to each thread).
 
-By introducing a stride (i.e., a gap between the elements each thread accesses), we ensure that **all threads in a warp collectively access contiguous memory locations in each iteration** (see the figure below). This pattern enables the hardware to potentially combine these accesses into a single memory transaction--a process known as **memory coalescing**, which significantly improves memory throughput. 
+As discussed in [Part 1](/_posts/2025-10-14-reduction_sum_part1.markdown), global memory access is relatively slow, so optimizing memory access efficiency is critical. By introducing a stride (i.e., a gap between the elements each thread accesses), we ensure that **all threads in a warp collectively access contiguous memory locations in each iteration** (see the figure below). This pattern enables the hardware to potentially combine these accesses into a single memory transaction--a process known as **memory coalescing**, which significantly improves memory throughput. 
 
-![image Memory coalescing](/assets/images/2025-10-27-reduction_sum_part1/kernel4_memory_coalesce.png)
+![image Memory coalescing](/assets/images/2025-10-27-reduction_sum_part2/kernel4_memory_coalesce.png)
 <p style="text-align: center;"><i>A coalesced access pattern in which contiguous memory locations are accessed during each `for` loop iteration.</i></p>
 
 > 💬 **Optional reading**
 >
-> Using an uncoalesced memory access pattern with 32 elements per thread results in an effective memory bandwidth of 776.987 GB/s, compared to 853.208 GB/s with coalesced access.
+> Using an uncoalesced memory access pattern with 32 elements per thread results in an effective memory bandwidth of 769.54 GB/s, compared to 842.07 GB/s with coalesced access.
 
 To summarize, we have the updated performance table below.
 
 
-| Kernel # <br />(128 threads/block) | Runtime (µs) | Mean Effective Bandwidth | % Peak Bandwidth |
+| Kernel # <br />(128 threads/block) | Mean Effective Bandwidth | % Peak Bandwidth |
 |:---:|:---:|:---:|:---:|
-| kernel 0 | 5,017.23 | 431.366 | 48.14 |
-| kernel 1 | 4,962.33 | 436.138 | 48.67 |
-| kernel 2 | 4,968.31 | 435.613 | 48.61 |
-| kernel 3 | 4,512.13 | 479.654 | 53.53 |
-| 🆕 kernel 4 🆕 | 2,517.57 | 853.208 | 95.22 |
+| kernel 0 | 431.03 | 48.10 |
+| kernel 1 | 434.87 | 48.53 |
+| kernel 2 | 434.73 | 48.51 |
+| kernel 3 | 479.68 | 53.53 |
+| 🆕 kernel 4 🆕 | 842.07 | 93.97 |
 
-At this point, we have reached 95% peak bandwidth. Let's see if the rest of the kernels in Mark Harris's presentation can improve it even further.
+At this point, we have reached 94% peak bandwidth. Let's see if the rest of the kernels in Mark Harris's presentation can improve it even further.
 
 # Kernel 5: loop unrolling
 
@@ -334,7 +336,7 @@ Mark Harris's presentation provides two kernels that perform loop unrolling: Red
 
 **Reduction #5 (Kernel 5 v1): unroll the last warp**
 
-In this implementation, only the final active warp (i.e., threads with indices < 32) is unrolled by defining and calling a helper function `warp_reduce` where these threads perform the summation without requiring any explicit thread synchronization. This is possible because all threads within a warp execute in **lockstep**, meaning, all active threads follow the same instruction stream simultanouesly, and none can advance ahead or fall behind. Note, however, that this strict lockstep behavior applies primarily to old GPU architectures; we'll discuss the implications of this later when addressing potential issues.
+In this implementation, only the final active warp (i.e., threads with indices < 32) is unrolled. We do so by defining and calling a helper function `warp_reduce` where these threads perform the summation *without requiring any explicit thread synchronization*. This is possible because all threads within a warp execute in **lockstep**, meaning, all active threads follow the same instruction stream simultaneously, and none can advance ahead or fall behind. Note, however, that this strict lockstep behavior applies primarily to older GPU architectures; we'll discuss the implications of this later when addressing potential issues.
 
 To implement the kernel, we add 3 modifications to the code:
 
@@ -389,7 +391,7 @@ __device__ void warp_reduce(volatile float* shared_data, size_t thread_idx) {
 }
 ```
 
-2\. Completely unroll the summation `for` loop by replacing the follwing:
+2\. Completely unroll the summation `for` loop by replacing the following:
 
 ```c++
     for (size_t stride = NUM_THREADS / 2; stride > NUM_THREADS_PER_WARP; stride >>= 1) {
@@ -430,29 +432,29 @@ with:
 
 The performance of the two kernels can be found below.
 
-| Kernel # <br />(128 threads/block) | Runtime (µs) | Mean Effective Bandwidth | % Peak Bandwidth |
+| Kernel # <br />(128 threads/block) | Mean Effective Bandwidth | % Peak Bandwidth |
 |:---:|:---:|:---:|:---:|
-| kernel 4 | 2,517.57 | 853.206 | 95.22 | 
-| kernel 5: unroll last warp | 2,517.51 | 853.226 | 95.22 |
-| kernel 5: completely unrolled | 2,517.56 | 853.212 | 95.22 |
+| kernel 4 | 842.07 | 93.97 | 
+| kernel 5: unroll last warp | 842.03 | 93.97 |
+| kernel 5: completely unrolled | 842.01 | 93.97 |
 
-There's only a very slight effective bandwidth improvement from Kernel 4 to Kernel 5, and no additional gain when moving from unrolling only the last warp to fully unrolling the summation `for` loop.
+There's no additional performance gain between Kernel 4 and the two versions of Kernel 5.
 
-*Why is the performance improvement from Kernel 4 to Kernel 5 so minimal?*
+*What causes the lack of improvement from Kernel 4 to Kernel 5?*
 
-To answer this question, I copied the implementation code of Kernel 4 and both versions of Kernel 5 into [Godbolt](https://godbolt.org/z/cPqhMPPhn).
+To answer this question, I moved the implementation code of Kernel 4 and both versions of Kernel 5 to [Godbolt](https://godbolt.org/z/cPqhMPPhn).
 
-Focusing first on Kernel 4, we see from the PTX code that the `for` loop has already been **automatically unrolled** by the compiler when inspecting the PTX code (see the figure below). This happens because modern CUDA compilers are capable of automatically unrolling loops--either completely or partially--whenever doing so is expected to improve performance.
+Focusing first on Kernel 4, we see from the PTX instructions that the `for` loop has already been **automatically unrolled** by the compiler (see the figure below). This happens because modern CUDA compilers are capable of automatically unrolling loops--either completely or partially--whenever doing so is expected to improve performance.
 
-![image Kernel 4 already unrolled](/assets/images/2025-10-27-reduction_sum_part1/kernel5_thread_coarsening_unrolled.png)
+![image Kernel 4 already unrolled](/assets/images/2025-10-27-reduction_sum_part2/kernel5_thread_coarsening_unrolled.png)
 <p style="text-align: center;"><i>The compiler has already automatically unrolled the `for` loop in Kernel 4. The PTX code lines highlighted in blue correspond to line 33 in the source code.</i></p>
 
 To disable this automatic unrolling, we can add `#pragma unroll 1` right before the `for` loop and see the differences in the PTX code.
 
-![image Kernel 4 with disabled unrolling](/assets/images/2025-10-27-reduction_sum_part1/kernel5_thread_coarsening.png)
-<p style="text-align: center;"><i>Adding `#pragma unroll 1` disables the automatic unrolling. The PTX code lines highlighted in blue correspond to line 34 in the source code.</i></p>
+![image Kernel 4 with disabled unrolling](/assets/images/2025-10-27-reduction_sum_part2/kernel5_thread_coarsening.png)
+<p style="text-align: center;"><i>Adding `#pragma unroll 1` disables the automatic unrolling. The PTX lines highlighted in blue correspond to line 34 in the source code.</i></p>
 
-Given this behavior, we can expect no additional performance gain when manually completely unrolling the `for` loop in the second version of Kernel 5.
+Given this behavior, we can expect no additional performance gain when manually unrolling the `for` loop.
 
 There is, however, one noticeable difference between Kernel 4 and Kernel 5 version 1 (which unrolls only the last warp). When we reveal the linked code for the lines under `warp_reduce()` in Kernel 5 version 1, we can see that the following PTX instructions are repeated contiguously (with different memory addresses and registers), without any of the overhead associated with thread synchronization or conditional checks that are present in Kernel 4's PTX code.
 
@@ -465,10 +467,10 @@ st.volatile.shared.f32 	[%r1], %f30;      // Store %f30 in shared memory with ad
 
 The figure below shows the side-by-side PTX instructions comparison between Kernel 4 and Kernel 5 version 1.
 
-![image Comparing PTX code between Kernel 4 and Kernel 5 (unroll last warp)](/assets/images/2025-10-27-reduction_sum_part1/kernel5_ptx.png)
+![image Comparing PTX code between Kernel 4 and Kernel 5 (unroll last warp)](/assets/images/2025-10-27-reduction_sum_part2/kernel5_ptx.png)
 <p style="text-align: center;"><i>The main difference between Kernel 4 and Kernel 5 version 1.</i></p>
 
-This difference might explain the slight bandwidth gain from Kernel 4 to Kernel 5.
+Even after eliminating instruction overhead, we don't observe any performance gain. This is likely because the kernel is primarily limited by memory throughput rather than instruction execution.
 
 ### Obsolete assumption
 
@@ -480,7 +482,7 @@ We will explore the use of warp shuffle intrinsics in the next kernel implementa
 
 > 📝 **Note**
 >
-> Warp shuffle intrinsics were first introduced in Kepler architecture (Compute Capability 3.x) around five years before Volta. These early versions assumed implicit thread synchronization within a warp.
+> Warp shuffle intrinsics were first introduced in Kepler architecture (Compute Capability 3.x) around five years before Volta. These early versions still assumed implicit thread synchronization within a warp.
 > 
 > The Volta architecture later refined this mechanism by introducing the `_sync` variants, which include an explicit synchronization mask to support Independent Thread Scheduling. The older intrinsics (those without `_sync`) were deprecated starting with CUDA 9.0.
 >
@@ -490,9 +492,9 @@ We will explore the use of warp shuffle intrinsics in the next kernel implementa
 
 Recall that in our previous implementations, threads exchanged data using shared memory. [Warp shuffle operations](https://docs.nvidia.com/cuda/cuda-c-programming-guide/#warp-shuffle-functions) allow a thread to directly read a register from another thread within the same warp, enabling threads in a warp to collectively exchange or broadcast data. By using warp shuffle operations, we can reduce shared memory usage, which in turn may allow increasing occupancy when needed.
 
-Additionally, shuffle operations are compiled directly to `SHFL` instructions in PTX/SASS. This is typically faster than using shared memory, as it effectively only costs a single instruction compared with the minimum of three steps needed for shared memory access (write, synchronize (`__syncthreads()`), and read). We will look into the instructions the later part of the section.
+Additionally, shuffle operations are compiled directly to `SHFL` instructions in PTX/SASS. This is typically faster than using shared memory, as it effectively only costs a single instruction compared with the minimum of three steps needed for shared memory access (write, synchronize (`__syncthreads()`), and read). We will look into the instructions in the later part of the section.
 
-To start, Let's define a new term we haven't used before in this post: the **lane ID**. The lane ID is the thread's index *within a warp*, ranging from 0 to 31. For example, threads with global indices 2 and 34 both have a land ID of 2 (since `threadIdx.x % 32 == 2`).
+To start, Let's define a new term we haven't used before in this post: the **lane ID**. The lane ID is the thread's index *within a warp*, ranging from 0 to 31. For example, threads with global indices 2 and 34 both have a land ID of 2 (since `thread index % 32 == 2`).
 
 In our kernel implementation, the initial setup (e.g., index variable initialization, input array shifting, and summing multiple elements per thread) remains the same as before, except for the size of `shared_data`. Now, `shared_data` is allocated with a length equal to the **number of warps** rather than the total block size, because we only need to store the partial sum from **each warp**.
 
@@ -505,7 +507,7 @@ In our kernel implementation, the initial setup (e.g., index variable initializa
 
 The rest of the implementation can be divided into the following steps.
 
-1\. Obtaining the partial sum from each warp. We'll be using `__shfl_down_sync()`.
+**1\. Obtaining the partial sum from each warp.** We'll be using `__shfl_down_sync()`.
 
 The function `__shfl_down_sync()` takes four arguments:
 - `unsigned mask`: a 32-bit mask indicating which threads in the warp are active
@@ -513,20 +515,21 @@ The function `__shfl_down_sync()` takes four arguments:
 - `unsigned int delta`: the offset that determines which lane's value the current thread will read
 - `int width`: the width of the shuffle group (default is the size of a warp: 32)
 
-This intrinsic allows each lane with ID `i` to access the value of `var` held by the lane with ID `i + delta`. **In other words, it shifts the values of `var` "down" the warp by `delta` lanes**. (I must say, the naming can be counterintuitive -- I initially expected it to access the value from lane `i-delta` instead...). Note the ID number will not wrap around the value of `width`, so the upper `delta` lanes will remain unchanged. 
+This intrinsic allows each lane with ID `i` to access the value of register `var` held by the lane with ID `i + delta`. **In other words, it shifts the values of `var` "down" the warp by `delta` lanes**. (I must say, the naming can be counterintuitive -- I initially expected it to access the value from lane `i-delta` instead...). Note the ID number will not wrap around the value of `width`, so the upper `delta` lanes will remain unchanged. 
 
 The figure below illustrates the following code where we use a shuffle width of 16:
 
 ```c++
 int x = threadIdx.x % 16 + 1;
 
+// All threads are active.
 constexpr unsigned int FULL_MASK{0xffffffff};
 unsigned int delta = 8;
 int width = 16;
 int y = __shfl_down_sync(FULL_MASK, x, delta, width);
 ```
 
-![image Warp shuffle illustration](/assets/images/2025-10-27-reduction_sum_part1/kernel6_shuffle.png)
+![image Warp shuffle illustration](/assets/images/2025-10-27-reduction_sum_part2/kernel6_shuffle.png)
 <p style="text-align: center;"><i>How shuffle down works given a delta of 8 and a group width of 16.</i></p>
 
 In our code, each lane adds its own `sum` value to the value of `sum` held by the lane `i + offset`, and stores the result back into `sum`.
@@ -549,7 +552,7 @@ We then store the partial sum in the shared memory with index `thread_idx / 32`.
 >
 > We can safely assume all threads in the warp are active here. In practice, however, we should always perform boundary check to prevent any thread from accessing out-of-bound memory.
 
-2\. Using the partial sums computed by each warp, we now need to obtain the **partial sum for the entire block**.
+**2\. Using the partial sums computed by each warp, we now need to obtain the partial sum for *the entire block***.
 
 ```c++
     // Determine active threads for obtaining block sum.
@@ -573,34 +576,26 @@ The idea is to have each thread read the partial sum produced by the warp whose 
         Y[block_idx] = sum;
 ```
 
-Earlier, I mentioned that warp shuffle operations require only a single PTX/SASS instruction. Examining the PTX instruction in [Godbolt](https://godbolt.org/z/3jYf4Y3Pv) corresponding to line 34 of the source code (the first `__shfl_down_sync()`), we see that the first iteration compiles into the following instructions:
+Earlier, I mentioned that warp shuffle operations require only a single assembly instruction. Examining the SASS instruction in [Godbolt](https://godbolt.org/z/Eb77Gd9E8) corresponding to line 34 of the source code (the first `__shfl_down_sync()`), we see that the first iteration compiles into the following instructions:
 
 ```
-mov.b32 	%r4, %f48;        // Move a 32-bit %f48 (which is the `sum` variable) into 32-bit %r4 register.
-mov.u32 	%r5, 2;           // Move value 2 into %r5    --> actually used in the last iteration.
-mov.u32 	%r6, 31;          // Move value 31 into %r6   --> the width argument.
-mov.u32 	%r7, 16;          // Move value 16 into %r7   --> the offset/delta argument.
-mov.u32 	%r8, -1;          // Move 0xffffffff into %r8 --> the mask argument.
-shfl.sync.down.b32 	%r9|%p12, %r4, %r7, %r6, %r8; // The SHFL instruction; %r9 corresponds to data destination and %p12 corresponds to predicate/mask output.
-mov.b32 	%f28, %r9;        // Move SHFL output data into %f28.
-add.f32 	%f29, %f48, %f28; // Add sum value + the SHFL output data.
-mov.b32 	%r10, %f29;       // Move the computed sum into %r10.
+ SHFL.DOWN PT, R4, R3, 0x10, 0x1f  // Perform the shuffle.
+ FADD R4, R4, R3                   // Add to sum variable.
 ```
-Although `__shfl_down_sync()` may appear to compile into multiple instructions, at the machine level the compiler can often optimize away the `mov` instructions if the value is already in the register. In other words, a `mov.b32` in PTX does not necessarily correspond to an additional machine instruction. As a result, each shuffle operation effectively costs only a single instruction.
 
 The performance of all the kernels so far can be found in the table below.
 
-| Kernel # <br />(128 threads/block) | Runtime (µs) | Mean Effective Bandwidth | % Peak Bandwidth |
+| Kernel # <br />(128 threads/block) | Mean Effective Bandwidth | % Peak Bandwidth |
 |:---:|:---:|:---:|:---:|
-| kernel 0 | 5,017.23 | 431.366 | 48.14 |
-| kernel 1 | 4,962.33 | 436.138 | 48.67 |
-| kernel 2 | 4,968.31 | 435.613 | 48.61 |
-| kernel 3 | 4,512.13 | 479.654 | 53.53 |
-| kernel 4 | 2,517.57 | 853.208 | 95.22 |
-| kernel 5 <br /> (obsolete warp-level operation) | 2,517.57 | 853.226 | 95.22 |
-| 🆕 kernel 6 🆕 | 2,517.42 | 853.259 | 95.22 |
+| kernel 0 | 431.03 | 48.10 |
+| kernel 1 | 434.87 | 48.53 |
+| kernel 2 | 434.73 | 48.51 |
+| kernel 3 | 479.68 | 53.53 |
+| kernel 4 | 842.07 | 93.97 |
+| kernel 5 | (obsolete) | (skipped) |
+| 🆕 kernel 6 🆕 | 841.93 | 93.96 |
 
-Note that we don't observe any improvement in Kernel 6 compared to Kernels 4 and 5. This result is consistent with [Lei Mao's findings](https://leimao.github.io/blog/CUDA-Reduction/), as sum reduction is a memory-bound operation--its performance is primarily limited by memory bandwidth rather than computation.
+Note that we don't observe any improvement in Kernel 6 compared to Kernels 4. This result is consistent with [Lei Mao's findings](https://leimao.github.io/blog/CUDA-Reduction/), as sum reduction is a memory-bound operation--its performance is primarily limited by memory bandwidth rather than computation.
 
 Nevertheless, it's still valuable to learn warp shuffle intrinsics, as they are fundamental tools for GPU performance optimization and serve as an excellent foundation for learning and understanding Cooperative Groups.
 
@@ -638,26 +633,26 @@ Since we're now loading four elements at once, we need to adjust both the `for` 
 
 This kernel shows a slight improvement compared to Kernel 6:
 
-| Kernel # <br />(128 threads/block) | Runtime (µs) | Mean Effective Bandwidth | % Peak Bandwidth |
+| Kernel # <br />(128 threads/block) | Mean Effective Bandwidth | % Peak Bandwidth |
 |:---:|:---:|:---:|:---:|
-| kernel 0 | 5,017.23 | 431.366 | 48.14 |
-| kernel 1 | 4,962.33 | 436.138 | 48.67 |
-| kernel 2 | 4,968.31 | 435.613 | 48.61 |
-| kernel 3 | 4,512.13 | 479.654 | 53.53 |
-| kernel 4 | 2,517.57 | 853.208 | 95.22 |
-| kernel 5 <br /> (obsolete warp-level operation) | 2,517.57 | 853.226 | 95.22 |
-| kernel 6 | 2,517.42 | 853.259 | 95.22 |
-| 🆕 kernel 7 🆕 | 2,516.79 | 853.471 | 95.25 |
+| kernel 0 | 431.03 | 48.10 |
+| kernel 1 | 434.87 | 48.53 |
+| kernel 2 | 434.73 | 48.51 |
+| kernel 3 | 479.68 | 53.53 |
+| kernel 4 | 842.07 | 93.97 |
+| kernel 5 | (obsolete) | (skipped) |
+| kernel 6 | 841.93 | 93.96 |
+| 🆕 kernel 7 🆕 | 842.22 | 93.99 |
 
 # Summary
 
-In this series, we take a deep dive into sum reduction: how it works, how to implement the kernel, and how to further optimize it. My approach builds on Mark Harris's original presentation, which I adapt to take advantage of modern hardware, smarter compilers, and the more recent GPU features.
+In this series, we take a deep dive into sum reduction: how it works, how to implement the kernel, and how to further optimize it. My approach builds on Mark Harris's presentation--which I adapt to take advantage of modern hardware, smarter compilers, and the more recent GPU features--and Lei Mao's reduction code.
 
 With these optimizations, our kernel hits an effective memory bandwidth of 842.22 GB/s, which is about 94% of the GPU's peak!
 
 Running the different kernels (excluding the now-deprecated Kernel 5) across various data sizes gives us the following plot. As we can see, Kernel 4 (thread coarsening) stands out with a significant performance boost.
 
-![image Performance of all kernels](/assets/images/2025-10-27-reduction_sum_part1/summary.png)
+![image Performance of all kernels](/assets/images/2025-10-27-reduction_sum_part2/summary.png)
 <p style="text-align: center;"><i>The performance of all kernels across various data sizes.</i></p>
 
 
@@ -665,9 +660,15 @@ Running the different kernels (excluding the now-deprecated Kernel 5) across var
 
 - [Optimizing Parallel Reduction in CUDA](https://developer.download.nvidia.com/assets/cuda/files/reduction.pdf) by Mark Harris (2007)
 - [CUDA Reduction](https://leimao.github.io/blog/CUDA-Reduction/) by Lei Mao (2024)
+- [Programming Massively Parallel Processors, 4th Edition](https://www.amazon.com/Programming-Massively-Parallel-Processors-Hands/dp/0323912311) by Hwu, Kirk, and Hajj (2023)
+- [Dissecting GPU Memory Hierarchy Through Microbenchmarking](https://ieeexplore.ieee.org/document/7445236) by Xinxin Mei and Xiaowen Chu (2016)
+- [Loop Unrolling](https://en.wikipedia.org/wiki/Loop_unrolling), Wikipedia
 - [Faster Parallel Reductions on Kepler](https://developer.nvidia.com/blog/faster-parallel-reductions-kepler/) by Justin Luitjens (2014)
 - [CUDA Pro Tip: Do The Kepler Shuffler](https://developer.nvidia.com/blog/cuda-pro-tip-kepler-shuffle/) by Mark Harris (2014)
 - [Using CUDA Warp-Level Primitives](https://developer.nvidia.com/blog/using-cuda-warp-level-primitives/) by Yuan Lin and Vinod Grover (2018)
+- [Godbolt](https://godbolt.org/) was used for viewing PTX/SASS instructions
+- [NVIDIA Nsight Compute](https://developer.nvidia.com/nsight-compute) was used for profiling the kernels
+- [CUDA C++ Programming Guide](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html)
 - Illustrations were made with [Excalidraw](https://excalidraw.com/)
 - The xkcd-style final plot was generated using [matplotlib](https://matplotlib.org/stable/api/_as_gen/matplotlib.pyplot.xkcd.html)
 

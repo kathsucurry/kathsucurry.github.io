@@ -1,6 +1,6 @@
 ---
 layout: post
-title:  "Reduction (Sum): part 0 | Introduction"
+title:  "Reduction (Sum): part 1 | Introduction"
 date:   2025-10-14
 categories: cuda
 ---
@@ -11,6 +11,8 @@ In this series, we will explore how to implement parallel sum reduction using CU
 2. [Choosing memory bandwidth as the metric](#2-choosing-memory-bandwidth-as-the-metric)
 3. [Utilizing shared memory](#3-utilizing-shared-memory)
 4. [Setting up the implementation code](#4-setting-up-the-implementation-code)
+
+We'll then dive into the implementation details and optimization techniques for reduction in [Part 2]({% link _posts/2025-10-27-reduction_sum_part2.markdown %}).
 
 **Note: this post assumes that the readers are already familiar with threads and blocks in GPU programming.** The Github link to the implementation code can be found [here](https://github.com/kathsucurry/cuda_reduction_sum).
 
@@ -36,8 +38,8 @@ for (size_t i{0}; i < N; ++i) {
 
 The above solution requires 8 time steps to complete, and this `O(N)` approach does not scale well with large inputs. So to improve performance and better utilize available resources (e.g., the GPU), we can restructure it as a tree-based approach:
 
-![image Tree-based approach example](/assets/images/2025-10-14-reduction_sum_part0/fig1_tree_approach.png)
-<p style="text-align: center;"><i>One tree-based approach to parallelize our problem example, drawn with Excalidraw.</i></p>
+![image Tree-based approach example](/assets/images/2025-10-14-reduction_sum_part1/fig1_tree_approach.png)
+<p style="text-align: center;"><i>One tree-based approach to parallelize our problem example.</i></p>
 
 Compared to the 8 time steps in the sequential approach, it now only requires 3 time steps: 4 sum operations in the first step, 2 sum operations in the second step, and one final sum operation in the third step.
 
@@ -45,7 +47,7 @@ Note that here, we assume sufficient resources to perform all 4 sum operations s
 
 The figure below illustrates this process: the kernel is first launched with 8 blocks to compute 8 partial sums from the input elements. These partial sums are then passed to a second kernel launch, now using a single block, to produce the final result.
 
-![image Multiple kernel invocations](/assets/images/2025-10-14-reduction_sum_part0/fig2_multiple_kernel_invocations.png)
+![image Multiple kernel invocations](/assets/images/2025-10-14-reduction_sum_part1/fig2_multiple_kernel_invocations.png)
 <p style="text-align: center;"><i>We may need to perform multiple kernel invocations to handle large datasets. Figure taken from Mark Harris's deck.</i></p>
 
 
@@ -96,32 +98,33 @@ One naive approach is to store the intermediate outputs in global memory. For in
 
 However, accessing global memory is slow, so having to access it so many times in the kernel would surely affect the performance significantly. This is where shared memory comes in.
 
-Unlike global memory, which is located in the GPU's off-chip DRAM, shared memory resides on-chip, resulting in significantly higher throughput. Shared memory is allocated per thread blocks, which means that all threads within a block can access the same shared memory variables. However, it has a much lower capacity compared to global memory, and depending on how much shared memory each block requires, it may limit the number of blocks that can be placed on each Streaming Multiprocessor (SM). You can read more about shared memory [here](https://developer.nvidia.com/blog/using-shared-memory-cuda-cc/).
+Shared memory resides on-chip, giving it significantly higher throughput compared to global memory, which is located in the GPU's off-chip DRAM. Shared memory is allocated per thread blocks, which means that all threads within a block can access the same shared memory variables. However, it has a much lower capacity compared to global memory; depending on how much shared memory each block requires, it may limit the number of blocks that can be placed on each Streaming Multiprocessor (SM). You can read more about shared memory [here](https://developer.nvidia.com/blog/using-shared-memory-cuda-cc/).
 
 > 📝 **Note**
 >
 > ["How CUDA Programming Works" presentation by Stephen Jones](https://www.nvidia.com/en-us/on-demand/session/gtcfall22-a41101/) provides a really good explanation of how the resources required by each thread block--such as shared memory-- affect the number of blocks that can be scheduled on each SM. The slide below, taken from the presentation, illustrates an example of this.
 
 >
-> ![image How the GPU places blocks on an SM](/assets/images/2025-10-27-reduction_sum_part1/fig0_sm_allocation.png)
+> ![image How the GPU places blocks on an SM](/assets/images/2025-10-27-reduction_sum_part2/fig0_sm_allocation.png)
 >
-> Given the block resource requirements (shown in the table at the bottom left), we can see that the GPU is unable to place **Block 3** due to the insufficient remaining shared memory. Since 3 blocks have already been placed (`3 * 48 kB = 144 kB`), only `160 kB - 144 kB = 16 kB` of shared memory remains, which is insufficient for another block that requires `48 kB`.
+> Given the block resource requirements (shown in the table on the right), we can see that the GPU is unable to place **Block 3** due to the insufficient remaining shared memory. Since 3 blocks have already been placed (`3 * 48 kB = 144 kB`), only `160 kB - 144 kB = 16 kB` of shared memory capacity remains, which is insufficient for another block that requires `48 kB`.
 
-We will use shared memory in all of the sum reduction implementations discussed in the next part of the series. For example, the first few implementations require `# threads per block * sizeof(float)` bytes of shared memory per thread block, so that each thread has its own slot.
+We will use shared memory in all of the sum reduction implementations discussed in [Part 2]({% link _posts/2025-10-27-reduction_sum_part2.markdown %}). For example, the first few implementations require `# threads per block * sizeof(float)` bytes of shared memory per thread block, so that each thread has its own slot.
 
 # 4. Setting up the implementation code
 
-I used, and slightly modified, [Lei Mao's reduction code setting](https://leimao.github.io/blog/CUDA-Reduction/) as follows.
+I used and slightly modified [Lei Mao's reduction code setting](https://leimao.github.io/blog/CUDA-Reduction/) as follows.
 
 1. **Error handling, output verification, and performance measurement**:  I include error handling (`CHECK_CUDA_ERROR()` and `CHECK_LAST_CUDA_ERROR()`), kernel output verification (within `profile_batched_kernel()`), and performance measurement (`measure_performance_in_ms`), with minor variable/function renaming based on personal preferences. All of this can be found in [`utils.cuh`](https://github.com/kathsucurry/cuda_reduction_sum/blob/main/src/utils.cuh).
-2. **Improved memory management**: instead of allocating, freeing, and reallocating device memory for each kernel invocation, I now allocate and free memory once in `main()` (see [`run_kernel.cu`](https://github.com/kathsucurry/cuda_reduction_sum/blob/main/run_kernel.cu)). This reduces overhead and speeds up the overall process--without affecting the kernel performance.
-3. **Kernel organization**: all kernel implementations are located in the [`kernels` directory](https://github.com/kathsucurry/cuda_reduction_sum/tree/main/src/kernels). This organization was inspired by [Simon's matmul kernel optimization repo](https://github.com/siboehm/SGEMM_CUDA).
+2. **Cache flush kernel**: To ensure accurate benchmarking when running the reduction kernels on smaller datasets, I included [a cache-flush kernel](https://github.com/kathsucurry/cuda_reduction_sum/blob/main/src/utils.cuh#L49). This prevents inflated effective memory bandwidth caused by repeated runs benefiting from cached data.
+3. **Improved memory management**: instead of allocating, freeing, and reallocating device memory for each kernel invocation, I now allocate and free memory once in `main()` (see [`run_kernel.cu`](https://github.com/kathsucurry/cuda_reduction_sum/blob/main/run_kernel.cu)). This reduces overhead and speeds up the overall process--without affecting the kernel performance.
+4. **Kernel organization**: all kernel implementations are located in the [`kernels` directory](https://github.com/kathsucurry/cuda_reduction_sum/tree/main/src/kernels). This organization was inspired by [Simon's matmul kernel optimization repo](https://github.com/siboehm/SGEMM_CUDA).
 
 
 
 ### Computing the effective bandwidth
 
-Recall in [section 1](#1-what-is-sum-reduction-and-how-can-we-parallelize-it) that we may need to perform multiple kernel invocations to obtain the final sum. In this post, we primarily want to measure the effective memory bandwidth of only the *first* kernel invocation to align with both [Lei Mao's](https://leimao.github.io/blog/CUDA-Reduction/) and [Mark Harris's](https://developer.download.nvidia.com/assets/cuda/files/reduction.pdf) implementations. This means that we would 1) load all the elements from the input list from the global memory and 2) store the partial sums of each batch at the end of the kernel execution back to the global memory.
+Recall in [section 1](#1-what-is-sum-reduction-and-how-can-we-parallelize-it) that we may need to perform multiple kernel invocations to obtain the final sum. In this post, we primarily want to measure the effective memory bandwidth of only the *first* kernel invocation to align with both [Lei Mao's](https://leimao.github.io/blog/CUDA-Reduction/) and [Mark Harris's](https://developer.download.nvidia.com/assets/cuda/files/reduction.pdf) implementations. This means that we would 1) load all the elements from the input list from the global memory and 2) store the partial sums of *each batch* at the end of the kernel execution back to the global memory.
 
 The calculation for getting the effective memory bandwidth can be found below.
 
@@ -147,24 +150,25 @@ float const effective_bandwidth{(num_bytes * 1e-6f) / latency};
 2. **Execute the kernel multiple times.** This helps smooth out variability in runtime and provides more consistent results.
 3. **Compute the average latency.** Averaging the runtimes over several runs leads to more reliable estimate than measuring a single execution.
 
-The steps above can be found in `measure_performance_in_ms()` [function](https://github.com/kathsucurry/cuda_reduction_sum/blob/main/src/utils.cuh#L46).
+The steps above can be found in `measure_performance_in_ms()` [function](https://github.com/kathsucurry/cuda_reduction_sum/blob/main/src/utils.cuh#L63).
 
 ### Problem setup
 
-We have a list of `2048 * 1024 * 256` floating-point elements. The length itself was chosen arbitrarily, as long as it's large enough and is also divisible by 1024.
+We have a list of 2<sup>29</sup> = 536,870,912 floating-point elements. The length itself was chosen arbitrarily, as long as it's large enough and is also divisible by 1024.
 
 > ⚠️ **Caution** ⚠️
 >
 > Since the length is divisible by 1024, **we don't include any boundary check** in any of the kernel implementations for simplicity. In real-world applications, however, **boundary checks are essential** to prevent out-of-bounds memory access, which can lead to undefined behavior or crashes.
 
-The elements in [Lei Mao's post](https://leimao.github.io/blog/CUDA-Reduction/) are all set to a constant value `1.0f`, which significantly speeds up verification, as the expected partial sum for each batch is simply the number of elements in the batch multiplied by the constant. However, this problem setup is prone to a specific bug: incorrect shifting of the input list when running the kernel, which can go unnotized because all elements are identical. To address this, I created two subclasses of `Elements`, each differing in how they initialize values and perform verification:
+The elements in [Lei Mao's post](https://leimao.github.io/blog/CUDA-Reduction/) are all set to a constant value `1.0f`, which significantly speeds up verification, as the expected partial sum for each batch is simply the number of elements in the batch multiplied by the constant. However, I found that this problem setup is prone to a specific bug: incorrect shifting of the input list when running the kernel, which can go unnotized because all elements are identical. To address this, I created two subclasses of `Elements`, each differing in how they initialize values and perform verification:
 
 1. `RandomElements`: initializes each element with a random floating-point value. During the verification, the partial sum of each batch is compared against the CPU-computed sum. This approach provides better test coverage but may be slower due to the large input size.
 
-1. `ConstantElements`: reproduces the setup from Lei Mao's post. Each element is initialized to a constant value provided to the constructor. Verification is faster but more prone to undetected bugs due to uniformity in data.
+2. `ConstantElements`: reproduces the setup from Lei Mao's post. Each element is initialized to a constant value provided to the constructor. Verification is faster but more prone to undetected bugs due to uniformity in data.
+
+When implementing the kernels, I first used `RandomElements` to verify that the code produced correct results. I then switched to `ConstantElements` for benchmarking purposes.
 
 The definition of all element classes can be found in [`elements.h` file](https://github.com/kathsucurry/cuda_reduction_sum/blob/main/src/elements.h).
-
 
 <br />
 
@@ -172,4 +176,12 @@ The definition of all element classes can be found in [`elements.h` file](https:
 
 <br />
 
-With the basics covered, we are now ready to implement and optimize the sum reduction algorithm! Click [here]({% link _posts/2025-10-27-reduction_sum_part1.markdown %}) to continue to the next part of the series.
+With the basics covered, we are now ready to implement and optimize the sum reduction algorithm! Click [here]({% link _posts/2025-10-27-reduction_sum_part2.markdown %}) to continue to the next part of the series.
+
+
+# Resources
+
+- [Optimizing Parallel Reduction in CUDA](https://developer.download.nvidia.com/assets/cuda/files/reduction.pdf) by Mark Harris (2007)
+- [CUDA Reduction](https://leimao.github.io/blog/CUDA-Reduction/) by Lei Mao (2024)
+- [Using Shared Memory in CUDA C/C++](https://developer.nvidia.com/blog/using-shared-memory-cuda-cc/) by Mark Harris (2013)
+- Illustrations were made with [Excalidraw](https://excalidraw.com/)
