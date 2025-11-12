@@ -1,0 +1,19 @@
+---
+layout: post
+title:  "GEMM"
+date:   2025-11-10
+categories: cuda
+---
+
+It's widely known that implementing and optimizing GEMM (**GE**neeral **M**atrix **M**ultiplication) is a fundamental prerequisite for learning GPU programming. In this post, we'll walk through the process of implementing and optimizing single-precision GEMM--from a brief overview of what the operation does to advanced optimizations using Tensor Cores. I'll primarily reference [Simon's GEMM post](https://siboehm.com/articles/22/CUDA-MMM) as a foundation, and then explore how to push performance further by leveraging additional features available on my GPU (RTX 5070 Ti). All performance measurements in this posts were taken on an RTX 5070 Ti and the implementation code can be found [here](https://github.com/kathsucurry/cuda_matrix_multiplication).
+
+This post entails the following sections:
+
+1. What does GEMM do?
+2. Problem setup
+3. Kernel implementation
+    a. Kernel 01: naive implementation
+    b. Kernel 02: blocktiling
+    c. Kernel 03: 2D thread coarsening
+    d. Kernel 04: vectorization
+
