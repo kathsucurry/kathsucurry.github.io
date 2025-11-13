@@ -13,14 +13,317 @@ I'll primarily reference [Simon's GEMM post](https://siboehm.com/articles/22/CUD
 This post is organized into the following sections:
 
 1. [**What does GEMM do?**](#1-what-does-gemm-do)
-2. **Problem setup**
-3. **Kernel implementation**
-    - Kernel 01: Naive implementation
-    - Kernel 02: Block tiling
-    - Kernel 03: 2D thread coarsening
+2. [**Compute-bound or memory-bound? Introducing the roofline model**](#2-compute-bound-or-memory-bound-introducing-the-roofline-model)
+3. [**Problem setup**](#3-problem-setup)
+4. [**Kernel implementation**](#4-kernel-implementations)
+    - [Kernel 01: Naive implementation](#kernel-01-naive-implementation)
+    - [Kernel 02: Block tiling](#kernel-02-block-tiling)
+    - [Kernel 03: 2D thread coarsening](#kernel-03-2d-thread-coarsening)
     - Kernel 04: Vectorization
+5. **Summary**
 
 # 1. What does GEMM do?
 
-Given three matrices $A$, $B$, and $C$
+Given three matrices $A$, $B$, and $C$, and two scalar values $\alpha$ and $\beta$, GEMM performs the following operation:
 
+$$
+C = \alpha A B + \beta C
+$$
+
+A standard matrix multiplication $AB$ is a case of GEMM where $\alpha = 1$ and $\beta = 0$.
+
+The matrix multiplication $AB$ by itself can be illustrated by the figure below.
+
+![image Matrix Multiplication](/assets/images/2025-11-10-gemm/intro_matmul.png)
+<p style="text-align: center;"><i>Matrix multiplication between $A$ (dimension: $M \times K$) and $B$ (dimension: $K \times N$), resulting in a matrix with dimension ($M \times N$).</i></p>
+
+To compute the $AB$ cell with coordinate [$y$, $x$], we perform a dot product between the entire row of $y$ in $A$ and the entire column of $x$ in $B$:
+
+$$
+AB[y, x] = \sum_{k=1}^{K} A[y, k] * B[k, x]
+$$
+
+# 2. Compute-bound or memory-bound? Introducing the roofline model
+
+In my earlier [Reduction (Sum) post]({% link _posts/2025-10-14-reduction_sum_part1.markdown %}), I mentioned that reduction is an example of a **memory-bound** kernel. But what about GEMM? How can we determine whether it's **compute-bound** or **memory-bound** in the first place? To answer these questions, we'd need to talk about **the Roofline Model**. 
+
+The Roofline Model is designed to guide the optimization process by defining the *peak performance* achievable on a given hardware. It's typically visualized as a 2D plot, with **Operational Intensity** on the $x$-axis and **Achievable Throughput** on the $y$-axis.
+
+![image Roofline model](/assets/images/2025-11-10-gemm/intro_roofline.png)
+<p style="text-align: center;"><i>The roofline model.</i></p>
+
+**Operational Intensity** measures the number of floating-point operations performed per byte of memory transferred (FLOPs/Bytes).
+
+On the other hand, **Throughput**, or performance, represents the number of floating-point operations a processor can execute per second (FLOPs/s).
+
+The Roofline Model visualizes two types of "roofs" in a 2D plot:
+
+1. **Memory bandwidth roof**, represents the (theoretical) peak memory bandwidth. As noted in the sum reduction post, the RTX 5070 Ti has a peak memory bandwidth of approximately 896 GB/s. This roof appears as a slanted line on the plot, following the equation $Performance = Memory\,Bandwidth \times Operational \, Intensity$.
+
+2. **Compute roof**, represents the theoretical peak throughput of the hardware. Based on the [specification document](https://images.nvidia.com/aem-dam/Solutions/geforce/blackwell/nvidia-rtx-blackwell-gpu-architecture.pdf), RTX5070Ti achieves a peak FP32 throughput of 43.9TFLOPs/s for standard operations and 87.9TFLOPs/s for tensor operations.
+
+Regions below the memory bandwidth roof are considered memory-bound, while regions below the compute roof are considered compute-bound.
+
+<div class="div-example">
+
+<h4>Example: determining whether the naive implementation is memory- or compute-bound</h4>
+
+<b>Computing the total floating-point operations</b>
+
+<br /><br />
+
+To simplify the total floating-point operations computation, we can divide the GEMM operations into 4 steps:
+
+<br />
+
+<ol>
+<li>
+$AB$
+<br />
+For each cell in $C$ (in total of $M \times N$ number of cells), we compute a dot operation of $K$ elements from $A$ and $K$ elements from $B$. So we have in total of $(M \times N) \times (K + K - 1)$ FLOPS where the first $K$ indicates the number of multiplication operations and the latter $K - 1$ indicates the number of addition operations.
+</li>
+
+<li>
+$\alpha AB$
+<br />
+Once we have $AB$ from step 1, we simply run another $MN$ multiplication operations to obtain $\alpha AB$.
+</li>
+
+<li>
+$\beta C$
+<br />
+Similar to step 2, we'll have another $MN$ FLOPs.
+</li>
+
+<li>
+$\alpha AB + \beta C$
+<br />
+In our final addition, we perform another $MN$ FLOPs.
+</li>
+</ol>
+
+To summarize, we'll have in total of
+
+$$
+(M \times N) \times (K + K - 1) + 3MN = (2MNK + 2MN) \,FLOPs
+$$
+
+<b>Computing the total data transferred</b>
+
+<br /><br />
+
+Similarly, we divide the total data transferred into three steps to simplify the computation:
+
+<br/>
+
+<ol>
+<li>
+$\alpha AB$
+<br />
+For each cell in $C$, we transfer $K$ elements from $A$ and $K$ elements from $B$, so we'll have in total of $2MNK \times 4\,Bytes$ data transferred.
+</li>
+
+<li>
+$\beta C$
+<br />
+We load all elements of $C$ = $MN \times 4\,Bytes$.
+</li>
+
+<li>
+$C = \alpha AB + \beta C$ (storing the updated $C$)
+<br />
+We store all elements of $C$ = $MN \times 4\,Bytes$.
+</li>
+</ol>
+
+Summing the Bytes transferred in all steps, we'll have 
+
+$$
+(2MNK + 2MN) \times 4\,Bytes
+$$
+
+<b>Computing the operational intensity</b>
+
+<br /><br />
+
+Given the total FLOPS and total data transfer calculated above, the operational intensity is only <b>0.25 FLOPS/Byte</b>. Even if the effective memory bandwidth approaches the peak bandwidth of 896 GB/s on the RTX5070Ti, this corresponds to a theoretical throughput of just <b>0.224 TFLOPs/s</b>. This value is significantly lower than the GPU's peak non-tensor FP32 performance of <b>43.9 TFLOPs/s</b>, placing the computation firmly within the <b>memory-bound region</b> of the Roofline Model.
+
+<br /><br />
+
+In brief, <b>naive GEMM implementation is memory-bound</b>, and we'll show how optimizing it with different techniques, along with larger $M$, $N$, and $K$ values, shift it to the compute-bound region.
+
+</div>
+
+
+# 3. Problem setup
+
+We aim to optimize the GEMM operation on matrices $A$, $B$, and $C$ with $M = N = K = 4096$. All matrices are stored in **row-major** order.
+
+The performance of each kernel is evaluated relative to **cuBLAS**, which serves as the reference implementation.
+
+# 4. Kernel implementations
+
+In this post, we will look into the following implementations:
+
+1. [**Kernel 01: Naive implementation**](#kernel-01-naive-implementation)
+2. [**Kernel 02: Block tiling**](#kernel-02-block-tiling)
+3. [**Kernel 03: 2D thread coarsening**](#kernel-03-2d-thread-coarsening)
+
+<div class="div-warning">
+<h4>🚨 CAUTION 🚨</h4>
+
+Before invoking any kernel, we make sure that $M$ and $N$ are both divisible by the block size, so we don't do any boundary check. In practice, however, 
+<b>boundary check is necessary to prevent incorrect or undefined behavior</b>.
+
+</div>
+
+
+#### Kernel 01: Naive implementation
+
+![image Kernel 01: Naive](/assets/images/2025-11-10-gemm/kernel1.png)
+<p style="text-align: center;"><i>Kernel 01.</i></p>
+
+In the naive implementation, each block--of size `BLOCK_DIM x BLOCK_DIM`--is responsible for computing `BLOCK_DIM x BLOCK_DIM` submatrix of $C$.
+Within each block, every thread loads $K$ elements from $A$ and $K$ elements from $B$, then performs a dot product over these elements.
+The corresponding kernel code is shown below.
+
+
+```c++
+template <size_t const BLOCK_DIM>
+__global__ void naive_gemm(int M, int N, int K, float alpha, float *A, float *B, float beta, float *C) {
+    size_t const global_x_idx{blockIdx.x * BLOCK_DIM + threadIdx.x};
+    size_t const global_y_idx{blockIdx.y * BLOCK_DIM + threadIdx.y};
+
+    // Perform boundary check.
+    if (global_x_idx < N && global_y_idx < M) {
+        float sum{0.0f};
+    
+        for (size_t k{0}; k < K; ++k) {
+            sum += A[global_y_idx * K + k] * B[k * N + global_x_idx];
+        }
+    
+        size_t const global_idx{global_y_idx * N + global_x_idx};
+        C[global_idx] = alpha * sum + beta * C[global_idx];
+    }
+}
+```
+
+Note that we use `x` to represent the horizontal axis and `y` to represent the vertical axis. This convention helps achieve better memory coalescing behavior:
+
+- Threads sharing the same `threadIdx.y` but having adjacent `threadIdx.x` values load the same row from $A$. This results in a **broadcast** rather than true memory coalescing.
+- Threads with the same `threadIdx.y` and adjacent `threadIdx.x` values load *adjacent elements* from $B$. Because $B$ is stored in row-major order, these accesses are **coalesced**.
+
+The kernel code can then be invoked using the following host code:
+
+```c++
+{
+    constexpr size_t BLOCK_DIM{32};
+    assert((N % BLOCK_DIM == 0) && (M % BLOCK_DIM == 0));
+    
+    dim3 grid_dim(CEIL_DIV(N, BLOCK_DIM), CEIL_DIV(M, BLOCK_DIM));
+    dim3 block_dim(BLOCK_DIM, BLOCK_DIM, 1);
+
+    naive_gemm<BLOCK_DIM><<<grid_dim, block_dim>>>(M, N, K, alpha, A, B, beta, C);
+}
+```
+
+and yields the following performance:
+
+| Kernel # | Performance | % cuBLAS performance |
+|:---:|:---:|:---:|:---:|
+| cuBLAS | 31.49 TFLOPs/s | 100% |
+| 🆕 kernel 01 🆕 | 1.96 TFLOPs/s | 6.22% |
+
+
+#### Kernel 02: Block tiling
+
+Recall from Kernel 01 that threads with the same `threadIdx.y` but different `threadIdx.x` values in each block load the **same** row from matrix $A$. Consequently, each element of $A$ is loaded $N$ times, and similarly, each element of $B$ is loaded $M$ times. To reduce global memory traffic, we can apply a **block tiling** technique that leverages **shared memory** for data reuse.
+
+For each `BLOCK_DIM x BLOCK_DIM` submatrix (tile) of $C$, the computation proceeds as follows:
+1. Allocate two `BLOCK_DIM x BLOCK_DIM` shared memory buffers: one for elements of $A$ and another for elements of $B$.
+2. Initialize a register `sum` to store the dot product for each thread.
+3. Load a `BLOCK_DIM x BLOCK_DIM` tile of $A$ corresponding to the same rows as $C$ and columns in the range range `[0, BLOCK_DIM)`.
+4. Load a `BLOCK_DIM x BLOCK_DIM` tile of $B$ corresponding to the same columns as $C$ and rows in the range range `[0, BLOCK_DIM)`.
+5. Compute and accumulate the partial dot products into the `sum` register.
+6. **Slide** the tile of $A$ to the right by `BLOCK_DIM`.
+7. **Slide** the tile of $B$ downward by `BLOCK_DIM`.
+8. Repeat steps 3 - 7 until the tile reaches the end of the matrix.
+
+The overall implementation can be illustrated below.
+
+![image Kernel 02: Block tiling](/assets/images/2025-11-10-gemm/kernel2.png)
+<p style="text-align: center;"><i>Kernel 02.</i></p>
+
+And the kernel code is as follows.
+
+
+```c++
+template <size_t const BLOCK_DIM>
+__global__ void block_tiling_gemm(int M, int N, int K, float alpha, float *A, float *B, float beta, float *C) {
+    __shared__ float As[BLOCK_DIM * BLOCK_DIM];
+    __shared__ float Bs[BLOCK_DIM * BLOCK_DIM];
+
+    size_t const block_row_offset{blockIdx.y * BLOCK_DIM};
+    size_t const block_col_offset{blockIdx.x * BLOCK_DIM};
+
+    float sum{0.0f};
+
+    for (size_t k_offset{0}; k_offset < K; k_offset += BLOCK_DIM) {
+        As[threadIdx.y * BLOCK_DIM + threadIdx.x] = A[(block_row_offset + threadIdx.y) * K + (threadIdx.x + k_offset)];
+        Bs[threadIdx.y * BLOCK_DIM + threadIdx.x] = B[(k_offset + threadIdx.y) * N + (block_col_offset + threadIdx.x)];
+        __syncthreads();
+
+        // Execute the dot product; recall that BLOCK_DIM and BLOCK_DIM are the same here.
+        for (size_t dot_idx{0}; dot_idx < BLOCK_DIM; ++dot_idx) {
+            sum += As[threadIdx.y * BLOCK_DIM + dot_idx] * Bs[dot_idx * BLOCK_DIM + threadIdx.x];
+        }
+        __syncthreads();
+    }
+
+    size_t const global_idx{(block_row_offset + threadIdx.y) * N + (block_col_offset + threadIdx.x)};
+    C[global_idx] = alpha * sum + beta * C[global_idx];
+}
+```
+
+With the tiling method described above, each element in matrix $A$ in global memory is now accessed only `N / BLOCK_DIM` times, and each element of matrix $B$ is accessed only `M / BLOCK_DIM` times. This reduction happens because each `BLOCK_DIM x BLOCK_DIM` tile is loaded into shared memory once and then reused by all threads in the block, significantly cutting down redundant global memory accesses. As a result, it leads to the following performance increase:
+
+| Kernel # | Performance | % cuBLAS performance |
+|:---:|:---:|:---:|:---:|
+| cuBLAS | 31.49 TFLOPs/s | 100% |
+| kernel 01 | 1.96 TFLOPs/s | 6.22% |
+| 🆕 kernel 02 🆕  | 3.46 TFLOPs/s | 10.99% |
+
+**Kernel 02 in the Roofline Model**
+
+Recall that Kernel 02 achieves a throughput of 3.47 TFLOPs/s.
+
+The total floating-point operations is the same as Kernel 01, which is
+
+$$
+2MN (K + 1) FLOPs
+$$
+
+The total data transferred, on the other hand, has significantly decreased. Each element in $A$ is now loaded from global memory only $N / BLOCK_DIM$ times, and each element of $B$ is loaded only `M / BLOCK_DIM` times. Consequently, the total global memory accesses are:
+
+$$
+A: M \times K \times \frac{N}{BLOCKDIM}, \, B: K \times N \times \frac{M}{BLOCKDIM}
+$$
+
+Combined with the global memory access of $C$, the overall global memory traffic becomes: 
+
+$$
+(\frac{2MNK}{BLOCKDIM} + 2MN) \times 4 \, Bytes
+$$
+
+Plugging in $M = N = K = 4096$ and a `BLOCK_DIM` of $32$, the operational intensity rises to approximately 7.94 FLOPs/B. While the kernel remains memory-bound, we can already see a shift from Kernel 01 toward the compute-bound region. To push it further, we need to increase the operational intensity even more. One effective approach is **thread coarsening** -- allowing each thread to perform more work -- which, in thise case, can further reduce global memory traffic and improve overall performance.
+
+
+#### Kernel 03: 2D thread coarsening
+
+
+
+
+# Resources
+
+- [How to Optimize a CUDA Matmul Kernel for cuBLAS-like Performance: a Worklog](https://siboehm.com/articles/22/CUDA-MMM) by Simon Boehm (2022).
+- [Understanding the Roofline Model](https://accelerated-computing.academy/fall25/resources/roofline/) taken from MIT 6.S894: Accelerated Computing Resources page

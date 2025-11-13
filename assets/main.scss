@@ -1,1 +1,27 @@
+---
+# Only the main Sass file needs front matter (the dashes are enough)
+---
+
 @import "minima";
+
+.div-example {
+    background-color: rgb(250, 236, 209); /* Sets the background color */
+    border: 1px solid #f8d080; /* Sets a solid border */
+    border-radius: 15px; /* Rounds the corners of the border */
+    padding: 20px; /* Adds space between the content and the border */
+    margin-bottom: 20px;
+}
+
+
+.div-warning {
+    background-color: rgb(255, 176, 176); /* Sets the background color */
+    border: 1px solid #fb7070; /* Sets a solid border */
+    border-radius: 15px; /* Rounds the corners of the border */
+    padding: 20px; /* Adds space between the content and the border */
+    margin-bottom: 20px;
+}
+
+
+.div-title {
+    font-size: 20px;
+}
