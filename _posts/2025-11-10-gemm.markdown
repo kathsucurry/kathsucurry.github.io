@@ -230,9 +230,9 @@ The kernel code can then be invoked using the following host code:
 and yields the following performance:
 
 | Kernel # | Performance | % cuBLAS performance |
-|:---:|:---:|:---:|:---:|
+|:---|:---:|:---:|:---:|
 | cuBLAS | 31.49 TFLOPs/s | 100% |
-| 🆕 kernel 01 🆕 | 1.96 TFLOPs/s | 6.22% |
+| kernel 01: naive 🆕 | 1.96 TFLOPs/s | 6.22% |
 
 
 #### Kernel 02: Block tiling
@@ -288,39 +288,165 @@ __global__ void block_tiling_gemm(int M, int N, int K, float alpha, float *A, fl
 With the tiling method described above, each element in matrix $A$ in global memory is now accessed only `N / BLOCK_DIM` times, and each element of matrix $B$ is accessed only `M / BLOCK_DIM` times. This reduction happens because each `BLOCK_DIM x BLOCK_DIM` tile is loaded into shared memory once and then reused by all threads in the block, significantly cutting down redundant global memory accesses. As a result, it leads to the following performance increase:
 
 | Kernel # | Performance | % cuBLAS performance |
-|:---:|:---:|:---:|:---:|
+|:---|:---:|:---:|:---:|
 | cuBLAS | 31.49 TFLOPs/s | 100% |
-| kernel 01 | 1.96 TFLOPs/s | 6.22% |
-| 🆕 kernel 02 🆕  | 3.46 TFLOPs/s | 10.99% |
+| kernel 01: naive | 1.96 TFLOPs/s | 6.22% |
+| kernel 02: block tiling 🆕  | 3.46 TFLOPs/s | 10.99% |
 
-**Kernel 02 in the Roofline Model**
+<div class="div-example">
+<h4>Kernel 02 in the Roofline Model</h4>
 
-Recall that Kernel 02 achieves a throughput of 3.47 TFLOPs/s.
-
-The total floating-point operations is the same as Kernel 01, which is
+Recall that Kernel 02 achieves a throughput of 3.47 TFLOPs/s. The <b>total floating-point operations</b> is the same as Kernel 01, which is
 
 $$
 2MN (K + 1) FLOPs
 $$
 
-The total data transferred, on the other hand, has significantly decreased. Each element in $A$ is now loaded from global memory only $N / BLOCK_DIM$ times, and each element of $B$ is loaded only `M / BLOCK_DIM` times. Consequently, the total global memory accesses are:
+The <b>total data transferred</b>, on the other hand, has significantly decreased. Each element in $A$ is now loaded from global memory only <code>N / BLOCK_DIM</code> times, and each element of $B$ is loaded only <code>M / BLOCK_DIM</code> times. Consequently, the total global memory accesses are:
 
 $$
-A: M \times K \times \frac{N}{BLOCKDIM}, \, B: K \times N \times \frac{M}{BLOCKDIM}
+A: M \times K \times \frac{N}{BLOCK\_DIM}, \, B: K \times N \times \frac{M}{BLOCK\_DIM}
 $$
 
 Combined with the global memory access of $C$, the overall global memory traffic becomes: 
 
 $$
-(\frac{2MNK}{BLOCKDIM} + 2MN) \times 4 \, Bytes
+(\frac{2MNK}{BLOCK\_DIM} + 2MN) \times 4 \, Bytes
 $$
 
-Plugging in $M = N = K = 4096$ and a `BLOCK_DIM` of $32$, the operational intensity rises to approximately 7.94 FLOPs/B. While the kernel remains memory-bound, we can already see a shift from Kernel 01 toward the compute-bound region. To push it further, we need to increase the operational intensity even more. One effective approach is **thread coarsening** -- allowing each thread to perform more work -- which, in thise case, can further reduce global memory traffic and improve overall performance.
+Plugging in $M = N = K = 4096$ and a `BLOCK_DIM` of $32$, the <b>operational intensity</b> rises to approximately 7.94 FLOPs/B. 
+</div>
 
+While Kernel 02 remains memory-bound, we can already see a shift from Kernel 01 toward the compute-bound region. To push it further, we need to increase the operational intensity even more. One effective approach is **thread coarsening** -- allowing each thread to perform more work -- which, in thise case, can further reduce global memory traffic and improve overall performance.
 
 #### Kernel 03: 2D thread coarsening
 
+This kernel corresponds to Kernel 5 in [Simon's blog post](https://siboehm.com/articles/22/CUDA-MMM). We now define several new terms:
 
+1. Block-level
+    - `BM` corresponds to the number of rows processed by each block
+    - `BN` corresponds to the number of columns processed by each block
+    - `BK` contributes to the shared memory size: `As` uses $BM \times BK$ slots and `Bs` uses $BK \times BN$ slots.
+
+2. Thread-level
+    - `TM` corresponds to the number of rows processed by each thread
+    - `TN` corresponds to the number of columns processed by each thread
+
+The kernel implementation is illustrated below.
+
+![image Kernel 01: Naive](/assets/images/2025-11-10-gemm/kernel3.png)
+<p style="text-align: center;"><i>Kernel 03.</i></p>
+
+What helped me most when implementing this kernel was **decoupling the shared-memory stores from the dot-product computation and the output stores**. For instance, `TM` and `TN` are used solely in the dot-product and output stages; they play no role in how data is written to shared memory..
+
+Additionally, during the shared-memory stage, each thread is responsible for populating `As` ($BM \times BK$) and `Bs` ($BK \times BN$). Because these tiles have different edge lengths, it's more straightforward to use **one-dimensional thread blocks** rather than two-dimensional ones.
+
+Specifically, instead of defining a 2D block shape like this:
+
+```c++
+dim3 block_dim(BN / TN, BM / TM);
+```
+
+we can switch to a 1D layout:
+
+```c++
+dim3 block_dim((BM * BN) / (TM * TN));
+```
+
+This simplifies the indexing logic while still covering the same number of threads.
+
+My kernel implementation is as follows.
+
+```c++
+template <size_t BM, size_t BN, size_t BK, size_t TM, size_t TN>
+__global__ void thread_coarsening_2d_gemm(int M, int N, int K, float alpha, float *A, float *B, float beta, float *C) {
+    __shared__ float As[BM * BK];
+    __shared__ float Bs[BK * BN];
+
+    // CHANGE 1: each thread now computes TM x TN tile.
+    float out_values[TM * TN] = {0.0f};
+
+    // CHANGE 2: since the block now has 1D layout, obtain the x and y coordinates
+    // within BM x BN (for dot product computation & output stages).
+    size_t const threadIdx_x{threadIdx.x % (BN / TN)};
+    size_t const threadIdx_y{threadIdx.x / (BN / TN)};
+
+    size_t const block_row_offset{blockIdx.y * BM};
+    size_t const block_col_offset{blockIdx.x * BN};
+
+    // CHANGE 3.1: compute the number of iterations each thread store shared memory elements;
+    // used only in the shared-memory stores.
+    size_t const LOAD_ITER_M{(BK * BM) / blockDim.x};
+    size_t const LOAD_ITER_N{(BK * BN) / blockDim.x};
+
+    // CHANGE 3.2: obtain the row and column indices of A and B during shared-memory stores.
+    size_t const A_block_row_idx{threadIdx.x / BK};
+    size_t const A_block_col_idx{threadIdx.x % BK};
+    size_t const B_block_row_idx{threadIdx.x / BN};
+    size_t const B_block_col_idx{threadIdx.x % BN};
+
+    for (size_t k_offset{0}; k_offset < K; k_offset += BK) {
+        // Stage 1: shared-memory stores.
+        for (size_t iter_m{0}; iter_m < LOAD_ITER_M; ++iter_m) {
+            As[threadIdx.x + (iter_m * blockDim.x)] = A[
+                (block_row_offset + (A_block_row_idx + (BM / LOAD_ITER_M * iter_m))) * K +
+                A_block_col_idx + k_offset];
+        }
+        for (size_t iter_n{0}; iter_n < LOAD_ITER_N; ++iter_n) {
+            Bs[threadIdx.x + (iter_n * blockDim.x)] = B[
+                (B_block_row_idx + k_offset + (BK / LOAD_ITER_N) * iter_n) * N +
+                block_col_offset + B_block_col_idx];
+        }
+        __syncthreads();
+
+        // Stage 2: dot-product computation.
+        for (size_t k{0}; k < BK; ++k) {
+            for (size_t tile_y_idx{0}; tile_y_idx < TM; ++tile_y_idx) {
+                for (size_t tile_x_idx{0}; tile_x_idx < TN; ++tile_x_idx) {
+                    out_values[tile_y_idx * TN + tile_x_idx] +=
+                        As[(threadIdx_y * TM + tile_y_idx) * BK + k] *
+                        Bs[k * BN + (threadIdx_x * TN + tile_x_idx)];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // Stage 3: output stores.
+    for (size_t tile_y_idx{0}; tile_y_idx < TM; ++tile_y_idx) {
+        for (size_t tile_x_idx{0}; tile_x_idx < TN; ++tile_x_idx) {
+            size_t const cell_row_idx{block_row_offset + threadIdx_y * TM + tile_y_idx};
+            size_t const cell_col_idx{block_col_offset + threadIdx_x * TN + tile_x_idx};
+            C[cell_row_idx * N + cell_col_idx] =
+                alpha * out_values[tile_y_idx * TN + tile_x_idx] +
+                beta * C[cell_row_idx * N + cell_col_idx];
+        }
+    }
+}
+```
+
+**Iterations during shared-memory stores**
+
+In many cases, the shared-memory tiles are larger than the number of threads in a block. In other words, `BM x BK` and `BK x BN` may exceed the block size. When that happens, each thread must perform multiple iterations to fully populate the shared memory. These iteration counts are stored in `LOAD_ITER_M` and `LOAD_ITER_N` variables. The kernel loops over `LOAD_ITER_M` to fill `As` and over `LOAD_ITER_N` to fill `Bs`. The figure below illustrates this process. For simplicity, we assume that
+
+- `(BM x BK) % BLOCK_DIM == 0`
+- `(BK x BN) % BLOCK_DIM == 0`
+- `BLOCK_DIM % BK == 0`
+- `BLOCK_DIM % BN == 0`
+
+In practice, however, we'll need proper boundary checks to handle cases where these conditions don't hold.
+
+![image Shared-memory stores in Kernel 03](/assets/images/2025-11-10-gemm/kernel3_sm_store.png)
+<p style="text-align: center;"><i>An example of shared-memory stores in Kernel 03.</i></p>
+
+This kernel achieves the following performance, marking a significant jump compared to the previous implementation.
+
+| Kernel # | Performance | % cuBLAS performance |
+|:---|:---:|:---:|:---:|
+| cuBLAS | 31.49 TFLOPs/s | 100% |
+| kernel 01: naive | 1.96 TFLOPs/s | 6.22% |
+| kernel 02: block tiling | 3.46 TFLOPs/s | 10.99% |
+| kernel 03: 2D thread coarsening 🆕 | 18.73 TFLOPs/s | 57.26% |
 
 
 # Resources
