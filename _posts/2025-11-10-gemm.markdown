@@ -19,7 +19,7 @@ This post is organized into the following sections:
     - [Kernel 01: Naive implementation](#kernel-01-naive-implementation)
     - [Kernel 02: Block tiling](#kernel-02-block-tiling)
     - [Kernel 03: 2D thread coarsening](#kernel-03-2d-thread-coarsening)
-    - Kernel 04: Vectorization
+    - [Kernel 04: Vectorized memory access](#kernel-04-vectorized-memory-access)
 5. **Summary**
 
 # 1. What does GEMM do?
@@ -150,7 +150,11 @@ Given the total FLOPS and total data transfer calculated above, the operational 
 
 <br /><br />
 
-In brief, <b>naive GEMM implementation is memory-bound</b>, and we'll show how optimizing it with different techniques, along with larger $M$, $N$, and $K$ values, shift it to the compute-bound region.
+It's important to note that this operational intensity is <i>theoretical</i>. Since elements in $A$ and $B$ are reused across threads and iterations, GPU caches (L1 and L2) automatically serve most repeated accesses; only the <i>first</i> access to a cache line actually goes to DRAM. As a result, Nsight Compute reports a much higher effective operational intensity of <b>18.33 FLOPs/Byte</b>, because caching hides the majority of DRAM traffic.
+
+<br /><br />
+
+Regardless of this difference, the conclusion remains: <b>naive GEMM implementation is memory-bound</b>, and we'll show how optimizing it with different techniques, along with larger $M$, $N$, and $K$ values, shift the performance toward the compute-bound region.
 
 </div>
 
@@ -168,6 +172,7 @@ In this post, we will look into the following implementations:
 1. [**Kernel 01: Naive implementation**](#kernel-01-naive-implementation)
 2. [**Kernel 02: Block tiling**](#kernel-02-block-tiling)
 3. [**Kernel 03: 2D thread coarsening**](#kernel-03-2d-thread-coarsening)
+4. [**Kernel 04: Vectorized memory access**](#kernel-04-vectorized-memory-access)
 
 <div class="div-warning">
 <h4>🚨 CAUTION 🚨</h4>
@@ -314,7 +319,7 @@ $$
 (\frac{2MNK}{BLOCK\_DIM} + 2MN) \times 4 \, Bytes
 $$
 
-Plugging in $M = N = K = 4096$ and a `BLOCK_DIM` of $32$, the <b>operational intensity</b> rises to approximately 7.94 FLOPs/B. 
+Plugging in $M = N = K = 4096$ and a <code>BLOCK_DIM</code> of $32$, the <b><i>theoretical</i> operational intensity</b> rises to approximately 7.94 FLOPs/B. 
 </div>
 
 While Kernel 02 remains memory-bound, we can already see a shift from Kernel 01 toward the compute-bound region. To push it further, we need to increase the operational intensity even more. One effective approach is **thread coarsening** -- allowing each thread to perform more work -- which, in thise case, can further reduce global memory traffic and improve overall performance.
@@ -386,7 +391,7 @@ __global__ void thread_coarsening_2d_gemm(int M, int N, int K, float alpha, floa
     size_t const B_block_col_idx{threadIdx.x % BN};
 
     for (size_t k_offset{0}; k_offset < K; k_offset += BK) {
-        // Stage 1: shared-memory stores.
+        // Stage 1: shared-memory stores (CHANGE 4).
         for (size_t iter_m{0}; iter_m < LOAD_ITER_M; ++iter_m) {
             As[threadIdx.x + (iter_m * blockDim.x)] = A[
                 (block_row_offset + (A_block_row_idx + (BM / LOAD_ITER_M * iter_m))) * K +
@@ -399,7 +404,7 @@ __global__ void thread_coarsening_2d_gemm(int M, int N, int K, float alpha, floa
         }
         __syncthreads();
 
-        // Stage 2: dot-product computation.
+        // Stage 2: dot-product computation (CHANGE 5).
         for (size_t k{0}; k < BK; ++k) {
             for (size_t tile_y_idx{0}; tile_y_idx < TM; ++tile_y_idx) {
                 for (size_t tile_x_idx{0}; tile_x_idx < TN; ++tile_x_idx) {
@@ -412,7 +417,7 @@ __global__ void thread_coarsening_2d_gemm(int M, int N, int K, float alpha, floa
         __syncthreads();
     }
 
-    // Stage 3: output stores.
+    // Stage 3: output stores (CHANGE 6).
     for (size_t tile_y_idx{0}; tile_y_idx < TM; ++tile_y_idx) {
         for (size_t tile_x_idx{0}; tile_x_idx < TN; ++tile_x_idx) {
             size_t const cell_row_idx{block_row_offset + threadIdx_y * TM + tile_y_idx};
@@ -448,8 +453,97 @@ This kernel achieves the following performance, marking a significant jump compa
 | kernel 02: block tiling | 3.46 TFLOPs/s | 10.99% |
 | kernel 03: 2D thread coarsening 🆕 | 18.73 TFLOPs/s | 57.26% |
 
+#### Kernel 04: Vectorized memory access
+
+Global memory access is relatively slow, so it's generally recommended to **combine multiple small transfers into a single larger transfer**. This approach reduces the overhead associated with each memory access. According to the [CUDA C++ Programming Guide](https://docs.nvidia.com/cuda/cuda-c-programming-guide/#maximize-memory-throughput), global memory can be accessed using **32-, 64-, or 128-byte memory transactions**.
+
+Up to now, all global memory loads have been performed using 32-byte transactions. In Kernel 3, for example, if we inspect the line where elements from `A` are loaded in [Godbolt](https://godbolt.org/z/nrcqdPvT3), we see the PTX instruction: `ld.global.f32`. The goal of the optimization in this kernel is to **reduce the number of global memory transfers** by merging them into **128-byte transactions**, which improves memory throughput. To do that, we use the built-in vector type `float4`, which packs four consecutive `float` elements into a single 16-byte vector.
+
+The code update is as follows.
+
+```c++
+template <size_t BM, size_t BN, size_t BK, size_t TM, size_t TN>
+__global__ void vectorize_gemm(int M, int N, int K, float alpha, float *A, float *B, float beta, float *C) {
+    ...
+
+    // CHANGE 1: update denominator.
+    size_t const LOAD_ITER_M{(BK * BM) / (4 * blockDim.x)};
+    size_t const LOAD_ITER_N{(BK * BN) / (4 * blockDim.x)};
+
+    // For storing into shared memory.
+    // CHANGE 2: update denominator
+    size_t const A_block_row_idx{threadIdx.x / (BK / 4)};
+    size_t const A_block_col_idx{(threadIdx.x % (BK / 4)) * 4};
+    size_t const B_block_row_idx{threadIdx.x / (BN / 4)};
+    size_t const B_block_col_idx{(threadIdx.x % (BN / 4)) * 4};
+
+    for (size_t k_offset{0}; k_offset < K; k_offset += BK) {
+        // Stage 1: shared-memory stores (CHANGE 3: load 4 elements at once using float4).
+        for (size_t iter_m{0}; iter_m < LOAD_ITER_M; ++iter_m) {
+            reinterpret_cast<float4 *>(&As[4 * (threadIdx.x + iter_m * blockDim.x)])[0] =
+                reinterpret_cast<float4 *>(&A[
+                    (block_row_offset + A_block_row_idx + (BM / LOAD_ITER_M * iter_m)) * K +
+                    A_block_col_idx + k_offset
+                ])[0];
+        }
+        
+        for (size_t iter_n{0}; iter_n < LOAD_ITER_N; ++iter_n) {
+            reinterpret_cast<float4 *>(&Bs[4 * (threadIdx.x + iter_n * blockDim.x)])[0] =
+                reinterpret_cast<float4 *>(&B[
+                    (B_block_row_idx + k_offset + (BK / LOAD_ITER_N) * iter_n) * N +
+                    block_col_offset + B_block_col_idx
+                ])[0];
+        }
+        
+        __syncthreads();
+
+        // Stage 2: dot-product computation (NO CHANGE).
+        ...
+    }
+
+    // Stage 3: output stores (CHANGE 4: store 4 elements at once using float4).
+    for (size_t tile_y_idx{0}; tile_y_idx < TM; ++tile_y_idx) {
+        for (size_t tile_x_idx{0}; tile_x_idx < TN; tile_x_idx += 4) {
+            size_t const cell_row_idx{block_row_offset + threadIdx_y * TM + tile_y_idx};
+            size_t const cell_col_idx{block_col_offset + threadIdx_x * TN + tile_x_idx};
+
+            float4 tmp = reinterpret_cast<float4 *>(
+                &C[cell_row_idx * N + cell_col_idx]
+            )[0];
+            tmp.x = alpha * out_values[tile_y_idx * TN + tile_x_idx + 0] + beta * tmp.x;
+            tmp.y = alpha * out_values[tile_y_idx * TN + tile_x_idx + 1] + beta * tmp.y;
+            tmp.z = alpha * out_values[tile_y_idx * TN + tile_x_idx + 2] + beta * tmp.z;
+            tmp.w = alpha * out_values[tile_y_idx * TN + tile_x_idx + 3] + beta * tmp.w;
+            reinterpret_cast<float4 *>(&C[cell_row_idx * N + cell_col_idx])[0] = tmp;
+        }
+    }
+}
+```
+
+The updated PTX instructions are available in [this Godbolt link](https://godbolt.org/z/sE5b6vsT3). Notably, the global memory load/store operations now use `ld.global.v4.u32` and`st.global.v4.f32`, while the shared memory stores use `st.shared.v4.u32`, confirming that the kernel performs 128-byte memory transfers.
+
+**Iterations during shared-memory stores**
+
+Note that if previously `LOAD_ITER_M` is defined as `(BK x BM) / BLOCK_DIM`, we now have the following:
+```c++
+size_t const LOAD_ITER_M{(BK * BM) / (4 * blockDim.x)};
+```
+since each thread now loads from global memory $A$ 4 elements at once in each iteration. The same applies to `LOAD_ITER_N`.
+
+![image Shared-memory stores in Kernel 04](/assets/images/2025-11-10-gemm/kernel4_sm_store.png)
+<p style="text-align: center;"><i>An example of shared-memory stores in Kernel 04.</i></p>
+
+| Kernel # | Performance | % cuBLAS performance |
+|:---|:---:|:---:|:---:|
+| cuBLAS | 31.49 TFLOPs/s | 100% |
+| kernel 01: naive | 1.96 TFLOPs/s | 6.22% |
+| kernel 02: block tiling | 3.46 TFLOPs/s | 10.99% |
+| kernel 03: 2D thread coarsening | 18.73 TFLOPs/s | 57.26% |
+| kernel 04: vectorize memory access 🆕 | 20.54 TFLOPs/s | 62.79% |
+
 
 # Resources
 
 - [How to Optimize a CUDA Matmul Kernel for cuBLAS-like Performance: a Worklog](https://siboehm.com/articles/22/CUDA-MMM) by Simon Boehm (2022).
 - [Understanding the Roofline Model](https://accelerated-computing.academy/fall25/resources/roofline/) taken from MIT 6.S894: Accelerated Computing Resources page
+- [CUDA C++ Programming Guide](https://docs.nvidia.com/cuda/cuda-c-programming-guide)
