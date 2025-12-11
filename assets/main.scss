@@ -22,10 +22,30 @@
 }
 
 
-.div-title {
-    font-size: 20px;
+.div-author-note {
+    background-color: rgb(231, 230, 230); /* Sets the background color */
+    border: 1px solid #999999; /* Sets a solid border */
+    border-radius: 15px; /* Rounds the corners of the border */
+    padding: 20px; /* Adds space between the content and the border */
+    margin-bottom: 20px;
 }
 
-code {
-    border-bottom: 20px;
+
+.div-heads-up {
+    background-color: rgb(199, 255, 219); /* Sets the background color */
+    border: 1px solid #72ffa1; /* Sets a solid border */
+    border-radius: 15px; /* Rounds the corners of the border */
+    padding: 20px; /* Adds space between the content and the border */
+    margin-bottom: 20px;
+}
+
+
+.div-implementation {
+    border: 1px solid #a0a0a0; /* Sets a solid border */
+    padding: 20px; /* Adds space between the content and the border */
+    margin-bottom: 20px;
+}
+
+.div-title {
+    font-size: 20px;
 }
