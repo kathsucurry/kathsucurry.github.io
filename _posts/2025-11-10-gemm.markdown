@@ -699,7 +699,7 @@ The following figure illustrates Kernel 05.
 <h4>Author's Note</h4>
 I agree with Simon that drawing the illustration helps with understanding the kernel implementation, especially when dealing with more complex methods. While the illustration above is more simplified, I would recommend incorporating $A$ and $B$ (or <code>As</code> and <code>Bs</code> in this case) at each level if things are still unclear, similar to how I illustrate Kernel 04 or how Simon illustrates each kernel.
 <br /><br />
-I probably have drawn the illustrations for Kernel 05 and Kernel 06 around 10 times each on papers while trying to explain the implementation to myself out loud...
+I have drawn the illustrations for Kernel 05 and Kernel 06 so many times on papers while trying to explain the implementation to myself out loud (though I also personally love to draw them; pretty diagrams make me happy ❤️).
 </div>
 <!-- END OF DIV -->
 
@@ -725,9 +725,9 @@ uint const thread_row_offset{(lane_idx / (WN / TN)) * TM};
 uint const thread_col_offset{(lane_idx % (WN / TN)) * TN};
 ```
 
-Once we update the offsets when shifting $A$, $B$, and $C$'s pointers, the rest of the implementation is exactly the same as the previous kernel!
+Once we update the offsets when shifting $A$, $B$, and $C$'s pointers, the rest of the implementation is exactly the same as the previous kernel! *That is the beauty of shifting the pointers approach~*
 
-Performance-wise, we don't really see much different between Kernel 04 and Kernel 05:
+Performance-wise, however, we don't really see much differences  between Kernel 04 and Kernel 05:
 
 | Kernel # | Performance | % cuBLAS performance |
 |:---|:---:|:---:|:---:|
@@ -740,6 +740,144 @@ Performance-wise, we don't really see much different between Kernel 04 and Kerne
 
 #### Kernel 06: warp tiling subdivided
 
+Kernel 05 has the following tiling hierarchy: `block tile (BM x BN) --> warp tile (WM x WN) --> thread tile (TM x TN)`. In Kernel 06, we add another level between `warp tile` and `thread tile`. Let's call the new hierarchy level `subwarp tile`.
+
+We also introduce some new terms (the same terms used in Simon's):
+
+1. `WMITER`: The number of subwarps within a warp vertically.
+2. `WNITER`: The number of subwarps within a warp horizontally.
+3. `WSUBM`: The number of rows within a subwarp.
+4. `WSUBN`: The number of columns within a subwarp.
+
+The following figure illustrates the difference between Kernel 05 and Kernel 06.
+
+![Kernel 05 vs Kernel 06](/assets/images/2025-11-10-gemm/kernel6.png)
+<p style="text-align: center;"><i>Kernel 05 vs Kernel 06.</i></p>
+
+Since each warp consists of 32 threads, the following requirement must apply.
+
+$$
+\frac{WM \times WN}{WMITER \times TM \times WNITER \times TN} = 32
+$$
+
+Additionally, each thread now computes `WMITER * TM * WNITER * TN` output elements, compared to only `TM * TN` output elements in the previous kernel. Some tunings, especially on `TM` and `TN` might be necessary.
+
+Stage 1 (shared-memory stores) remains the same as in the previous kernel. In stage 2 (dot-product computation) and stage 3 (epilogue; output stores), we simply place the subwarp loop on top of the existing thread-tiling loop:
+
+**Stage 2 (dot-product computation)**
+
+```c++
+// reg_M is now [WMITER * TM] and reg_N is [WNITER * TN].
+for (int k{0}; k < BK; ++k) {
+    for (int wmiter_idx{0}; wmiter_idx < WMITER; ++wmiter_idx) {
+        for (int tm_idx{0}; tm_idx < TM; ++tm_idx) {
+            reg_M[wmiter_idx * TM + tm_idx] = As[
+                (wmiter_idx * WSUBM + tm_idx) * BK + k
+            ];
+        }
+    }
+
+    for (int wniter_idx{0}; wniter_idx < WNITER; ++wniter_idx) {
+        for (int tn_idx{0}; tn_idx < TN; ++tn_idx) {
+            reg_N[wniter_idx * TN + tn_idx] = Bs[
+                k * BN + (wniter_idx * WSUBN + tn_idx)
+            ];
+        }
+    }
+
+    for (int wmiter_idx{0}; wmiter_idx < WMITER; ++wmiter_idx)
+        for (int wniter_idx{0}; wniter_idx < WNITER; ++wniter_idx)
+            for (int tm_idx{0}; tm_idx < TM; ++tm_idx)
+                for (int tn_idx{0}; tn_idx < TN; ++tn_idx) {
+                    out_values[(wmiter_idx * TM + tm_idx) * (WNITER * TN) + wniter_idx * TN + tn_idx] +=
+                        reg_M[wmiter_idx * TM + tm_idx] * reg_N[wniter_idx * TN + tn_idx];
+                }
+}
+```
+
+**Stage 3 (epilogue; output stores)**
+
+```c++
+for (int wmiter_idx{0}; wmiter_idx < WMITER; ++wmiter_idx)
+    for (int wniter_idx{0}; wniter_idx < WNITER; ++wniter_idx) {
+        uint const tile_row_idx{wmiter_idx * WSUBM};
+        uint const tile_col_idx{wniter_idx * WSUBN};
+            
+        for (int tm_idx{0}; tm_idx < TM; ++tm_idx)
+            for (int tn_idx{0}; tn_idx < TN; tn_idx += 4) {
+                uint const cell_row_idx{tile_row_idx + tm_idx};
+                uint const cell_col_idx{tile_col_idx + tn_idx};
+                    
+                float4 tmp = reinterpret_cast<float4 *>(
+                    &C[cell_row_idx * N + cell_col_idx]
+                    )[0];
+                uint const first_out_idx = (wmiter_idx * TM + tm_idx) * (WNITER * TN) + wniter_idx * TN + tn_idx;
+                tmp.x = alpha * out_values[first_out_idx + 0] + beta * tmp.x;
+                tmp.y = alpha * out_values[first_out_idx + 1] + beta * tmp.y;
+                tmp.z = alpha * out_values[first_out_idx + 2] + beta * tmp.z;
+                tmp.w = alpha * out_values[first_out_idx + 3] + beta * tmp.w;
+                reinterpret_cast<float4 *>(
+                    &C[cell_row_idx * N + cell_col_idx]
+                )[0] = tmp;
+            }
+    }     
+```
+
+These modifications lead to a performance of 28.70 TFLOPs/s, which is more than 90% of cuBLAS!
+
+| Kernel # | Performance | % cuBLAS performance |
+|:---|:---:|:---:|:---:|
+| cuBLAS | 31.66 TFLOPs/s | 100% |
+| kernel 01: naive | 2.05 TFLOPs/s | 6.47% |
+| kernel 02: block tiling | 3.49 TFLOPs/s | 11.02% |
+| kernel 03: 2D thread coarsening | 20.05 TFLOPs/s | 63.33% |
+| kernel 04: vectorized memory access | 26.16 TFLOPs/s | 82.63% |
+| kernel 05: warp tiling | 26.19 TFLOPs/s | 82.72% |
+| kernel 06: warp tiling subdivided 🆕 | 28.70 TFLOPs/s | 90.65% |
+
+*How does Kernel 06 lead to such performance improvements?*
+
+If we look at my parameters setup, we'll see that each thread in both Kernel 05 and Kernel 06 compute the same amount of output elements . In particular, each thread computes 128 output elements in both configurations:
+
+| Kernel # | NUM_THREADS | WM | WN | TM | TN | WMITER | WNITER | 
+|:---|:---:|:---:|:---:|:---|:---:|:---:|:---:|
+| Kernel 05 | 128 | 32 | 128 | 16 | 8 | 1 | 1 |
+| Kernel 06 | 128 | 32 | 128 | 8 | 4 | 2 | 2 |
+
+<!-- START OF DIV -->
+<div class="div-author-note">
+<h4>Author's Note</h4>
+As a precaution, I also ran Kernel 06 with the Kernel 05 configuration above, and it produced performance very similar to what's shown in the performance table.
+</div>
+<!-- END OF DIV -->
+
+It's fascinating to observe that the throughput of Kernel 06 is approximately 10% higher than Kernel 05. One noticeable difference identified when profiling Kernel 05 vs Kernel 06 using Nsight is that Kernel 06 has 12.84% `instruction per cycles (IPC) elapsed` higher than Kernel 05.
+
+If we examine [the PTX instructions for each `K` iteration](https://godbolt.org/z/49PPss8hd) in the `compute_gemm()` function (where I use Kernel 06 implementation code for both kernels but with different configurations), we can see that increasing both `WMITER` and `WNITER` from 1 to 2 changes the ordering of the PTX instructions:
+
+![PTX instructions: Kernel 05 vs Kernel 06](/assets/images/2025-11-10-gemm/kernel6_ptx.png)
+<p style="text-align: center;"><i>PTX instructions: Kernel 05 vs Kernel 06.</i></p>
+
+The `fma` instruction can only execute once *the data it depends on is already available* in registers. In Kernel 05, all eight column values of `Bs` must be loaded into `reg_N` (since `TN = 8` in the Kernel 05 configuration) before the `fma` instructions for subsequent rows can be issued. This creates large `fma` blocks, each containing eight `fma` instructions. These long dependency chains introduce longer stalls, which reduce instruction-level parallelism (ILP) and ultimately lower IPC.
+
+On the other hand, in Kernel 06, the `fma` instructions for subsequent rows only need to wait for the first four column elements of `Bs` to be loaded into `reg_N` (since `TN = 4` in the Kernel 06 configuration). As a result, each `fma` block is smaller, containing only four `fma` instructions. After the first `TM * TN` FMAs complete, we then see the next four `reg_N` stores begin. Additionally, the PTX instructions in Kernel 06 also include **blocks of fully independent FMA instructions** with no preceding register loads, which can execute immediately and provide pure ILP, further boosting IPC.
+
+Another way to illustrate the PTX instruction ordering is shown in the diagram below.
+
+![PTX instructions diagram: Kernel 05 vs Kernel 06](/assets/images/2025-11-10-gemm/kernel6_ptx_diagram.png)
+<p style="text-align: center;"><i>PTX instruction diagram: Kernel 05 vs Kernel 06.</i></p>
+
+Overall, we can summarize the patterns of the register stores and FMA instructions as below:
+
+- In Kernel 05, all FMAs rely on all $16 \times 8`
+
+
+
+As mentioned earlier in the Kernel 05 introduction, the additional subwarp hierarchy enables increasing **instruction-level parallelism**. 
+
+
+
+increase 12.84% (executed ipc elapsed)
 # PTX
 
 ```
