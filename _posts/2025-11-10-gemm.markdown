@@ -181,6 +181,9 @@ In this post, we will look into the following implementations:
 3. [**Kernel 03: 2D thread coarsening**](#kernel-03-2d-thread-coarsening)
 4. [**Kernel 04: Vectorized memory access**](#kernel-04-vectorized-memory-access)
 5. [**Kernel 05: Warp tiling**](#kernel-05-warp-tiling)
+6. [**Kernel 06: Warp tiling subdivided**](#kernel-06-warp-tiling-subdivided)
+7. [**Kernel 07: Transpose `As`**](#kernel-07-transpose-as)
+8. [**Kernel 08: Double buffering and asynchronous gmem loads**](#kernel-08-double-buffering-and-asynchronous-gmem-loads)
 
 <!-- START OF DIV -->
 <div class="div-warning">
@@ -699,7 +702,7 @@ The following figure illustrates Kernel 05.
 <h4>Author's Note</h4>
 I agree with Simon that drawing the illustration helps with understanding the kernel implementation, especially when dealing with more complex methods. While the illustration above is more simplified, I would recommend incorporating $A$ and $B$ (or <code>As</code> and <code>Bs</code> in this case) at each level if things are still unclear, similar to how I illustrate Kernel 04 or how Simon illustrates each kernel.
 <br /><br />
-I have drawn the illustrations for Kernel 05 and Kernel 06 so many times on papers while trying to explain the implementation to myself out loud (though I also personally love to draw them; pretty diagrams make me happy ❤️).
+I ended up drawing the illustrations for Kernel 05 and Kernel 06 so many times on papers while trying to explain the implementation to myself out loud (though I also personally love to draw them; pretty diagrams make me happy ❤️).
 </div>
 <!-- END OF DIV -->
 
@@ -867,17 +870,120 @@ Another way to illustrate the PTX instruction ordering is shown in the diagram b
 ![PTX instructions diagram: Kernel 05 vs Kernel 06](/assets/images/2025-11-10-gemm/kernel6_ptx_diagram.png)
 <p style="text-align: center;"><i>PTX instruction diagram: Kernel 05 vs Kernel 06.</i></p>
 
-Overall, we can summarize the patterns of the register stores and FMA instructions as below:
+Out of curiosity, I experimented with different `TM`, `TN`, `WMITER`, and `WNITER` configurations while keeping the total number of elements computed per thread the same (i.e., 128 elements). The stage 3 (epilogue; output stores) configuration was kept the same  throughout these experiments. I did, however, have to disable the matrix verification step temporarily since the differing configurations would otherwise produce incorrect outputs.
 
-- In Kernel 05, all FMAs rely on all $16 \times 8`
+| TM | TN | WMITER | WNITER | TFLOPs/s | Remark |
+|:---|:---:|:---:|:---:|:---|:---:|
+| 8 | 4 | 1 | 4 | 25.39 | |
+| 8 | 4 | 2 | 2 | 28.70 | Original configuration |
+| 8 | 4 | 4 | 1 | 21.53 | |
+| 4 | 4 | 1 | 8 | 21.53 | |
+| 4 | 4 | 2 | 4 | 25.41 | |
+| 4 | 4 | 4 | 2 | 28.73 | Very similar to our original's performance! |
+| 4 | 4 | 8 | 1 | 21.52 | |
+| 4 | 8 | 1 | 4 | 21.51 | |
+| 4 | 8 | 2 | 2 | 22.30 | |
+| 4 | 8 | 4 | 1 | 26.23 | |
+| 1 | 16 | 1 | 8 | 15.11 | |
+| 1 | 16 | 2 | 4 | 19.99 | |
+| 1 | 16 | 4 | 2 | 15.66 | |
+| 1 | 16 | 8 | 1 | 15.59 | |
+
+If we group the experiments by `TN` and look at the the best-performing configuration in each group, we see that larger `TN` values lead to worse performance. This is expected because a larger `TN` creates a longer dependency chain: more column elements must be loaded into `reg_N` before FMAs for subsequent rows can begin.
+
+Focusing on the experiments where `TN = 4`, we observe that performance increases as `WNITER` decreases, reaches a peak, and then eventually drops again. When `WNITER = 1`, there are no blocks of fully independent FMA instructions, which likely explains the performance drop.
+
+However, a larger `WNITER` does not always guarantee better performance. One possible explanation is that increasing `WNITER` enlarges the overall block of alternating register-store and FMA instructions. As these blocks grow, they may introduce new dependency chains and ultimately limiting ILP.
+
+
+#### Kernel 07: Transpose `As`
+
+One optimization recommended in Simon's post is to vectorize the shared-memory loads as well. Vectorizing the loads from `Bs` is straightforward because `Bs` is always accessed horizontally. In contrast, vectorizing the loads from `As` requires transposing `As` since its elements are currenty loaded vertically.
+
+When storing into a transposed `As`, we can still vectorize the global-memory loads from $A$ using `float4`, and then manually distribute the four elements into the appropriate rows of the transposed shared-memory buffer:
+
+```c++
+// Part of load_from_gmem() function.
+for (int A_load_offset{0}; A_load_offset < BM; A_load_offset += stride_A) {
+    // Keep the vectorized loads.
+    float4 tmp = reinterpret_cast<float4 *>(&A[(A_block_row_idx + A_load_offset) * K + A_block_col_idx])[0];
+
+    As[(A_block_col_idx + 0) * BM + A_block_row_idx + A_load_offset] = tmp.x;
+    As[(A_block_col_idx + 1) * BM + A_block_row_idx + A_load_offset] = tmp.y;
+    As[(A_block_col_idx + 2) * BM + A_block_row_idx + A_load_offset] = tmp.z;
+    As[(A_block_col_idx + 3) * BM + A_block_row_idx + A_load_offset] = tmp.w;
+}
+```
+
+We then vectorize all shared memory loads as follows.
+
+```c++
+for (int k{0}; k < BK; ++k) {
+    for (int wmiter_idx{0}; wmiter_idx < WMITER; ++wmiter_idx) {
+        // Notice that we now add 4 to tm_idx each time.
+        for (int tm_idx{0}; tm_idx < TM; tm_idx += 4) {
+            reinterpret_cast<float4 *>(&reg_M[wmiter_idx * TM + tm_idx])[0] =
+                reinterpret_cast<float4 *>(&As[k * BM + (wmiter_idx * WSUBM + tm_idx)])[0];
+        }
+    }
+    for (int wniter_idx{0}; wniter_idx < WNITER; ++wniter_idx) {
+        // Notice that we now add 4 to tn_idx each time.
+        for (int tn_idx{0}; tn_idx < TN; tn_idx += 4) {
+            reinterpret_cast<float4 *>(&reg_N[wniter_idx * TN + tn_idx])[0] =
+                reinterpret_cast<float4 *>(&Bs[k * BN + (wniter_idx * WSUBN + tn_idx)])[0];
+        }
+    }
+
+    ...
+
+}
+```
+
+After applying these modifications, generating the PTX instructions should now show `ld.shared.v4.f32` when loading from shared memory instead of `ld.shared.f32`. 
+
+Overall, transposing `As` leads to a noticeable improvement compared to Kernel 06!
+
+| Kernel # | Performance | % cuBLAS performance |
+|:---|:---:|:---:|:---:|
+| cuBLAS | 31.66 TFLOPs/s | 100% |
+| kernel 01: naive | 2.05 TFLOPs/s | 6.47% |
+| kernel 02: block tiling | 3.49 TFLOPs/s | 11.02% |
+| kernel 03: 2D thread coarsening | 20.05 TFLOPs/s | 63.33% |
+| kernel 04: vectorized memory access | 26.16 TFLOPs/s | 82.63% |
+| kernel 05: warp tiling | 26.19 TFLOPs/s | 82.72% |
+| kernel 06: warp tiling subdivided | 28.70 TFLOPs/s | 90.65% |
+| kernel 07: tranpose `As` 🆕 | 29.71 TFLOPs/s | 93.84% |
+
+<!-- START OF DIV -->
+<div class="div-author-note">
+<h4>Author's Note</h4>
+I did experiment with only vectorizing <code>Bs</code> loads in Kernel 06; it did not lead to any significant performance improvement.
+</div>
+<!-- END OF DIV -->
+
+*How does transposing `As` affect shared memory bank conflicts?*
+
+Recall that shared memory is divided into 32 equally-sized banks where each bank can handle a 4-byte load or store operation per clock cycle. Consecutive 4-byte words are assigned to consecutive banks, so in our case, each `float` element occupies one bank.
+
+**`As` stores**
+
+In the previous kernels, each thread-block stores multiple `float4` elements loaded from $A$ into a shared-memory buffer `As` of size $[BM \times BK]$. With my current $BK$ set to 32, elements from the same column but different rows in `As` are placed in the same bank. Since each thread stores a `float4` element, its four `float` components now occupy four successive banks. In other words, every eight threads together cover all 32 banks. Because a warp contains 32 threads, a warp would cover four consecutive rows, which results in **4-way bank conflicts**.
+
+Now that `As` is transposed, instead of storing into consecutive indices horizontally, we now store the elements into `As` vertically. The four rows that were initially covered by a warp now become four columns where each column is of size $BK$. Since my $BM$ value is also divisible by 32, i.e., the elements in each column of the transposed buffer are assigned to the same bank, we now have **`BK`-way bank conflicts**, which is 32-way bank conflicts in my case...
+
+**`As` loads**
+
+![How elements in As are initially loaded](/assets/images/2025-11-10-gemm/kernel7.png)
+<p style="text-align: center;"><i>The <b>first</b> elements loaded from non-transposed <code>As</code> by all threads in a warp during the <code>k</code>th, <code>WMITER = 0</code>, <code>WNITER = 0</code> iteration.</i></p>
+
+In each iteration over `K`, `WMITER`, and `WNITER`, all threads in a warp compute one element from each `TM * TN` block. As a result, the number of elements a warp needs to load from `As` equals the number of `TM * TN` blocks stacked vertically. In my configuration where `WM = 32`, `WMITER = 2`, `TM = 8`, this results in 2-way bank conflicts.
+
+Once `As` is transposed, the number of elements loaded from `As` remains the same, but they are now distributed across different columns. Because of this rearrangement, **bank conflicts are eliminated**.
 
 
 
-As mentioned earlier in the Kernel 05 introduction, the additional subwarp hierarchy enables increasing **instruction-level parallelism**. 
+#### Kernel 08: Double buffering and asynchronous gmem loads
 
-
-
-increase 12.84% (executed ipc elapsed)
 # PTX
 
 ```
