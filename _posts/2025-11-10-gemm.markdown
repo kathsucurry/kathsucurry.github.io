@@ -25,9 +25,14 @@ This post is organized into the following sections:
     - [**Kernel 05: Warp tiling**](#kernel-05-warp-tiling)
     - [**Kernel 06: Warp tiling subdivided**](#kernel-06-warp-tiling-subdivided)
     - [**Kernel 07: Transpose `As`**](#kernel-07-transpose-as)
-    - [**Kernel 08: Double buffering and asynchronous gmem loads**](#kernel-08-asynchronous-global-memory-loads-and-double-buffering)
+    - [**Kernel 08: Asynchronous global-memory loads + double buffering**](#kernel-08-asynchronous-global-memory-loads--double-buffering)
 5. [**Tensor cores**](#5-tensor-cores)
-5. [**Half-precision GEMM implementation**](#6-half-precision-gemm-implementations)
+6. [**Half-precision GEMM implementation**](#6-half-precision-gemm-implementations)
+    - [**Kernel 09: Tensor cores (wmma API)**](#kernel-09-tensor-cores-wmma-api)
+    - [**Kernel 10: Tensor cores + asynchronous gmem loads**](#kernel-10-tensor-cores--asynchronous-gmem-loads)
+    - [**Kernel 11: Tensor cores + double buffering**](#kernel-11-tensor-cores--double-buffering)
+    - [**Kernel 12: Tensor cores + two-level pipeline**](#kernel-12-tensor-cores--two-level-pipeline)
+    - [**Kernel 13: Tensor cores (mma instructions)**](#kernel-13-tensor-cores-mma-instructions)
 6. **Summary**
 
 <hr class="hr-top" /><hr />
@@ -193,7 +198,7 @@ In this post, we will look into the following implementations:
 5. [**Kernel 05: Warp tiling**](#kernel-05-warp-tiling)
 6. [**Kernel 06: Warp tiling subdivided**](#kernel-06-warp-tiling-subdivided)
 7. [**Kernel 07: Transpose `As`**](#kernel-07-transpose-as)
-8. [**Kernel 08: Double buffering and asynchronous gmem loads**](#kernel-08-asynchronous-global-memory-loads-and-double-buffering)
+8. [**Kernel 08: Asynchronous global-memory loads + double buffering**](#kernel-08-asynchronous-global-memory-loads--double-buffering)
 
 <!-- START OF DIV -->
 <div class="div-warning">
@@ -242,15 +247,15 @@ __global__ void __launch_bounds__(BLOCK_DIM * BLOCK_DIM) naive_gemm(
 ```
 
 <!-- START OF DIV -->
-<div class="div-author-note">
-<h4>Author's Note</h4>
+<div class="div-interested">
+<h4>If You're Curious...</h4>
 The usages of <code>__launch_bounds__()</code> and <code>__restrict__</code> are ways to aid optimization by providing additional information to the compiler. More information on <code>__launch_bounds__()</code> and <code>__restrict__</code> can be found in the CUDA C++ Programming Guide, particularly in sections <a href="https://docs.nvidia.com/cuda/cuda-c-programming-guide/#launch-bounds">10.38. Launch Bounds</a> and <a href="https://docs.nvidia.com/cuda/cuda-c-programming-guide/#restrict">10.2.6. __restrict__</a>, respectively.
 </div>
 <!-- END OF DIV -->
 
 <!-- START OF DIV -->
-<div class="div-heads-up">
-<h4>Heads up!</h4>
+<div class="div-author-note">
+<h4>Author's Note</h4>
 If you look at the code, you'd notice that some basic kernel functions have been transformed into function templates so that it can be used for both single- and half-precision GEMMs. You can find the list of implemented kernels <a href="https://github.com/kathsucurry/cuda_matrix_multiplication/blob/main/src/kernels.cuh">here</a>.
 </div>
 <!-- END OF DIV -->
@@ -1007,7 +1012,7 @@ With no change to `Bs` stores and loads, it is interesting to see that although 
 
 <hr />
 
-#### Kernel 08: Asynchronous global-memory loads and double buffering
+#### Kernel 08: Asynchronous global-memory loads + double buffering
 
 As the name suggests, this kernel applies 2 optimizations:
 1. asynchronous global-memory loads, and
@@ -1121,13 +1126,13 @@ We have now reached approximately 96% of cuBLAS performance on single-precision 
 
 # 5. Tensor cores
 
-Multiply-add is the most frequently used operation in modern neural networks as it's the building block of fully-connected and convolutional layers (read [here](https://docs.nvidia.com/cutlass/latest/media/docs/cpp/implicit_gemm_convolution.html) for how convolutional layers can be mapped into implicit GEMM). As modern neural networks continue to grow in size and demand significantly higher computational capability, the ability to accelerate multiply-add operations becomes crucial.
+Multiply-add is the most frequently used operation in modern neural networks as it is the building block of fully-connected and convolutional layers (read [here](https://docs.nvidia.com/cutlass/latest/media/docs/cpp/implicit_gemm_convolution.html) if you're curious about how convolutional layers can be mapped into implicit GEMM). As modern neural networks continue to grow in size and demand significantly higher computational capability, the ability to accelerate multiply-add operations becomes crucial.
 
 To address this need, [the Volta GPU architecture introduced tensor cores](https://images.nvidia.com/content/volta-architecture/pdf/volta-architecture-whitepaper.pdf), a specialized component of the GPU architecture designed to accelerate *matrix* multiply-accumulate operations. Tensor cores provide significantly higher throughput than CUDA cores. For example, on my RTX 5070 Ti, the peak *BF16 throughput with FP32 accumulation* reaches 87.9 TFLOPs/s, compared to only 43.9 TFLOPs/s of peak non-tensor core throughput.
 
 There are two ways to use tensor cores: via `wmma` or `mma` instructions. Both instruction types include load, store, and computation operations, which are performed collectively by all threads in a warp.
 
-`wmma` instructions can be used through a high-level API or via explicit PTX instructions. Overall, `wmma` is more straightforward to use, but also more rigid, as it does not allow modification of how matrix elements are distributed across threads. `mma`, on the other hand, can only be used via PTX instructions and requires a deeper level of understanding, but offers greater flexibility. For example, custom swizzling can be used with `mma` but not with `wmma`.
+`wmma` instructions can be used through a high-level API or via explicit PTX instructions. Overall, `wmma` is more straightforward to use, but also more rigid, as it does not allow modification of how matrix elements are distributed across threads. `mma`, on the other hand, can only be used via PTX instructions and requires a deeper level of understanding, but offers greater flexibility. For example, custom swizzling can be used with `mma` but not with `wmma` (to my current knowledge).
 
 <!-- START OF DIV -->
 <div class="div-author-note">
@@ -1142,7 +1147,59 @@ We will examine these points in more details later, but essentially, tensor core
 
 # 6. Half-precision GEMM implementations
 
+Tensor cores do not currently support all data types. The available combinations of data types for the multiplicand and accumulator matrices are listed in [this table](https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-data-types). For instance, 
+among floating-point data types, there is currently no support for using FP32 for both the multiplicands and the accumulator. As a result, we will focus on half-precision GEMM implementations in the rest of the post.
 
+In particular, we will use the 16-bit alternative floating-point data type BFloat16 (`.bf16`) for the multiplicands $A$ and $B$, and the 32-bit IEEE floating-point data type (`.f32`) for the accumulator $C$.
+
+<!-- START OF DIV -->
+<div class="div-interested">
+<h4>If You're Curious...</h4>
+BFloat16 stands for <i>Brain Floating Point Format</i>. It is a custom 16-bit floating-point format developed by Google Brain with the goal of accelerating matrix multiplication operations, where each multiply-accumulate operation uses BFloat16 for the multiplication and 32-bit IEEE floating point (FP32) for accumulator.
+<br />
+
+<div style="background-color: white; padding-top: 20px; margin-top: 20px;">
+    <img src="/assets/images/2025-11-10-gemm/hgmm_bfloat16.png" alt="The floating-point formats.">
+</div>
+<p style="text-align: center;"><i>The three floating-point formats; figure taken from <a href="https://cloud.google.com/blog/products/ai-machine-learning/bfloat16-the-secret-to-high-performance-on-cloud-tpus">the Google Cloud's BFloat16 blog</a>.</i></p>
+
+As shown in the figure above, BFloat16 has the same dynamic range as FP32 due to having the same number of exponent bits. This allows simpler to and from FP32 compared to FP16 and provides greater robustness against numerical instability during training. Given its 16-bit size, BFloat16 reduces memory usage and can lead to overall faster performance, making it advantageous for layers that do not require a high level of precision. You can read more about the BFloat16 format <a href="https://cloud.google.com/blog/products/ai-machine-learning/bfloat16-the-secret-to-high-performance-on-cloud-tpus">here</a>.
+</div>
+<!-- END OF DIV -->
+
+To implement HGEMM, I begin by enabling half-precision computation in *some* of the SGEMM kernels implemented above and examine their performance relative to SGEMM. I then explore the use of tensor cores via the `wmma` api and optimize the implementation from there. Each kernel implementation is compared against cuBLAS performance.
+
+The performance of some of the kernels above on half-precision GEMM is as follows.
+
+| Kernel # | SGEMM Performance (TFLOPs/s) | HGEMM Performance (TFLOPs/s) | % HGEMM cuBLAS performance |
+|:---|:---:|:---:|:---:|
+| cuBLAS | 31.66 | 88.81 | 100% |
+| kernel 01: naive | 2.05 | 2.90 | 3.26% |
+| kernel 02: block tiling | 3.49 | 2.80 | 3.15% |
+| kernel 04: vectorized memory access | 26.16 | 26.33 | 29.65% |
+| kernel 05: warp tiling | 26.19 | 26.81 | 32.74% |
+
+While cuBLAS performance shoots up to 88.81 TFLOPs/s for HGEMM, kernels up to Kernel 05 show performance similar to SGEMM, so I stopped there and shifted focus to tensor cores.
+
+The kernels using tensor cores are as follows.
+
+1. [**Kernel 09: Tensor cores (wmma API)**](#kernel-09-tensor-cores-wmma-api)
+2. [**Kernel 10: Tensor cores + asynchronous gmem loads**](#kernel-10-tensor-cores--asynchronous-gmem-loads)
+3. [**Kernel 11: Tensor cores + double buffering**](#kernel-11-tensor-cores--double-buffering)
+4. [**Kernel 12: Tensor cores + two-level pipeline**](#kernel-12-tensor-cores--two-level-pipeline)
+5. [**Kernel 13: Tensor cores (mma instructions)**](#kernel-13-tensor-cores-mma-instructions)
+
+
+#### Kernel 09: Tensor cores (wmma API)
+
+
+#### Kernel 10: Tensor cores + asynchronous gmem loads
+
+#### Kernel 11: Tensor cores + double buffering
+
+#### Kernel 12: Tensor cores + two-level pipeline
+
+#### Kernel 13: Tensor cores (mma instructions)
 
 
 
