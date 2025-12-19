@@ -32,6 +32,7 @@ This post is organized into the following sections:
     - [**Kernel 10 & 11: Tensor cores + asynchronous gmem loads + double buffering**](#kernel-10--11-tensor-cores--asynchronous-gmem-loads--double-buffering)
     - [**Kernel 12: Tensor cores + three-level pipeline**](#kernel-12-tensor-cores--three-level-pipeline)
     - [**Kernel 13: Tensor cores (mma instructions)**](#kernel-13-tensor-cores-mma-instructions)
+    - [**Kernel 14 & 15: Swizzled shared memory + three-level pipeline**](#kernel-14--15-swizzled-shared-memory--three-level-pipeline)
 6. **Summary**
 
 <hr class="hr-top" /><hr />
@@ -1129,16 +1130,16 @@ Multiply-add is the most frequently used operation in modern neural networks as 
 
 To address this need, [the Volta GPU architecture introduced tensor cores](https://images.nvidia.com/content/volta-architecture/pdf/volta-architecture-whitepaper.pdf), a specialized component of the GPU architecture designed to accelerate *matrix* multiply-accumulate operations. Tensor cores provide significantly higher throughput than CUDA cores. For example, on my RTX 5070 Ti, the peak *BF16 throughput with FP32 accumulation* reaches 87.9 TFLOPs/s, compared to only 43.9 TFLOPs/s of peak non-tensor core throughput.
 
-There are two ways to use tensor cores: via `wmma` or `mma` instructions. Both instruction types include load, store, and computation operations, which are performed collectively by all threads in a warp.
+There are two ways to use tensor cores: via wmma or mma instructions. Both instruction types include load, store, and computation operations, which are performed collectively by all threads in a warp.
 
-`wmma` instructions can be used through a high-level API or via explicit PTX instructions. Overall, `wmma` is more straightforward to use, but also more rigid, as it does not allow modification of how matrix elements are distributed across threads. `mma`, on the other hand, can only be used via PTX instructions and requires a deeper level of understanding of how it works, but offers greater flexibility. For example, custom swizzling can be used with `mma` but not with `wmma` (to my current knowledge).
+wmma instructions can be used through a high-level API or via explicit PTX instructions. Overall, wmma is more straightforward to use, but also more rigid, as it does not allow modification of how matrix elements are distributed across threads. mma, on the other hand, can only be used via PTX instructions and requires a deeper level of understanding of how it works, but offers greater flexibility. For example, custom swizzling can be used with mma but not with wmma (to my current knowledge).
 
 <!-- START OF DIV -->
 <div class="div-author-note">
 <h4>Author's Note</h4>
 Notice two specific details in the explanation above: (1) the emphasis on <i>matrix</i> in matrix multiply-accumulate and (2) the particular example of <i>BF16 throughput with FP32 accumulation</i>.
 <br /><br />
-We will examine these points in more details later, but essentially, tensor cores operate on matrices with predetermined sizes and data types for each matrix, depending on the instruction being used (<code>wmma</code> or <code>mma</code>).
+We will examine these points in more details later, but essentially, tensor cores operate on matrices with predetermined sizes and data types for each matrix, depending on the instruction being used (wmma or mma).
 </div>
 <!-- END OF DIV -->
 
@@ -1166,7 +1167,7 @@ As shown in the figure above, BFloat16 has the same dynamic range as FP32 due to
 </div>
 <!-- END OF DIV -->
 
-To implement HGEMM, I begin by enabling half-precision computation in *some* of the SGEMM kernels implemented above and examine their performance relative to SGEMM. I then explore the use of tensor cores via the `wmma` API and optimize the implementation from there. Each kernel implementation is compared against cuBLAS performance.
+To implement HGEMM, I begin by enabling half-precision computation in *some* of the SGEMM kernels implemented above and examine their performance relative to SGEMM. I then explore the use of tensor cores via the wmma API and optimize the implementation from there. Each kernel implementation is compared against cuBLAS performance.
 
 The performance of some of the kernels above on half-precision GEMM is as follows.
 
@@ -1187,6 +1188,7 @@ The kernels using tensor cores are as follows.
 2. [**Kernel 10 & 11: Tensor cores + asynchronous gmem loads + double buffering**](#kernel-10--11-tensor-cores--asynchronous-gmem-loads--double-buffering)
 4. [**Kernel 12: Tensor cores + three-level pipeline**](#kernel-12-tensor-cores--three-level-pipeline)
 5. [**Kernel 13: Tensor cores (mma instructions)**](#kernel-13-tensor-cores-mma-instructions)
+6. [**Kernel 14 & 15: Swizzled shared memory + three-level pipeline**](#kernel-14--15-swizzled-shared-memory--three-level-pipeline)
 
 
 #### Kernel 09: Tensor cores (wmma API)
@@ -1273,7 +1275,7 @@ As mentioned earlier, we no longer explicitly specify which elements each thread
 Stage 3 (epilogue + output stores) code can be found below.
 
 ```c++
-// Create a new fragment to store elements from C.
+// Create a new fragment to hold elements from C.
 nvcuda::wmma::fragment<
     nvcuda::wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
 
@@ -1314,10 +1316,6 @@ The performance of the kernel can be found in the table below. As we can see, ut
 | Kernel # | Performance (TFLOPs/s) | % cuBLAS performance |
 |:---|:---:|:---:|:---:|
 | cuBLAS | 88.81 | 100% |
-| kernel 01: naive | 2.90 | 3.26% |
-| kernel 02: block tiling | 2.80 | 3.15% |
-| kernel 04: vectorized memory access | 26.33 | 29.65% |
-| kernel 05: warp tiling | 26.81 | 30.19% |
 | kernel 06: warp tiling, subdivided | 27.23 | 30.66% |
 | kernel 09: tensor cores (wmma API) 🆕 | 65.38 | 73.62% |
 
@@ -1331,6 +1329,8 @@ We can treat fragments as registers that hold multiple elements. In the <a href=
 </div>
 <!-- END OF DIV -->
 
+<hr />
+
 #### Kernel 10 & 11: Tensor cores + asynchronous gmem loads + double buffering
 
 In both Kernel 10 and 11, we apply the two optimization techniques from Kernel 08 one by one, specifically:
@@ -1343,14 +1343,12 @@ These modifications result in the following performance improvements:
 | Kernel # | Performance (TFLOPs/s) | % cuBLAS performance |
 |:---|:---:|:---:|:---:|
 | cuBLAS | 88.81 | 100% |
-| kernel 01: naive | 2.90 | 3.26% |
-| kernel 02: block tiling | 2.80 | 3.15% |
-| kernel 04: vectorized memory access | 26.33 | 29.65% |
-| kernel 05: warp tiling | 26.81 | 30.19% |
 | kernel 06: warp tiling, subdivided | 27.23 | 30.66% |
 | kernel 09: tensor cores (wmma API) | 65.38 | 73.62% |
 | kernel 10: tensor cores + async gmem loads 🆕 | 73.77 | 83.06% |
 | kernel 11: tensor cores + double buffering 🆕 | 80.33 | 90.45% |
+
+<hr />
 
 #### Kernel 12: Tensor cores + three-level pipeline
 
@@ -1484,23 +1482,228 @@ With these modifications, we're able to keep register usage sufficiently low and
 | kernel 11: tensor cores + double buffering | 80.33 | 90.45% |
 | kernel 12: tensor cores + three-level pipeline 🆕 | 87.13 | 98.11% |
 
+<hr />
+
 #### Kernel 13: Tensor cores (mma instructions)
 
+So far, our kernels have mainly rlied on the wmma APIs. When loading the matrices into registers using these APIs (i.e., calling `load_matrix_sync()`), we can only provide the starting address, the stride in elements between consecutive rows or columns depending on the layout, and the memory layout of the matrix. The API then implicitly determines how the data is distributed across threads in the warp.
 
+In some situations, however, we need more flexibility over how matrix elements are assigned to individual threads. Achieving this level of flexibility requires using the low-level MMA instructions directly.
+
+As mentioned earlier, working with mma instructions demands a much deeper understanding of their underlying mechanics. We will walk through the implementation step-by-step.
+
+Note that the matrix sizes supported by wmma and mma are different. mma supports only the `m16n8k16` and `m16n8k8` shapes. In this kernel, we'll use the `m16n8k16` matrix size.
+
+<!-- START OF DIV -->
+<div class="div-interested">
+<h4>If You're Curious...</h4>
+If you're wondering why wmma and mma have different supported matrix sizes, someone also asked the same question <a href="https://forums.developer.nvidia.com/t/why-does-wmma-and-mma-support-different-matrix-tile-size/271067">here</a>.
+</div>
+<!-- END OF DIV -->
+
+Just like Kernel 09, there's no change to stage 1 (shared-memory stores). We will cover the modifications in stage 2 and stage 3, particularly:
+
+1. Storing elements into $A$ and $B$ fragments,
+2. Performing matrix multiplication, and
+3. Epilogue and output stores
+
+**1\. Storing elements into $A$ and $B$ fragments**
+
+The [`ldmatrix` instruction](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#warp-level-matrix-instructions-ldmatrix) is used to load matrix elements from shared memory into fragment registers. In this process, threads can have two roles:
+
+- *some or all* threads supply the shared-memory addresses from which the matrix elements are loaded
+- *all* threads allocate and provide the destination registers that receive the loaded elements
+
+Before we discuss this further, let's start with examining the syntax of the instruction.
+
+```
+ldmatrix.sync.aligned.shape.num{.trans}{.ss}.type r, [p];
+
+.shape   = {.m8n8, .m16n16};
+.num     = {.x1, .x2, .x4};
+.ss      = {.shared{::cta}};
+.type    = {.b16, .b8};
+```
+
+When performing the instruction, all threads in a warp collectively load a matrix from the location indicated by address operand `p` in the specified state space `.ss` into destination register `r`. In our case, `.ss` and `.type` are simply `.shared` and `.b16`, respectively.
+
+To determine the correct value for the remaining parameters and arguments, we need to consider the following key aspects:
+
+- **The values of `.shape`. and `.num` are based on the data type and the chosen matrix size**
+
+Since we are loading 16-bit data, we must use `.m8n8` matrix load as it is the only matrix load shape that supports 16-bit data types. Given the `.shape` parameter and the matrix size we choose then determine the `.num` parameter. In the case of choosing the `m16n8k16` matrix size, we load a `16x16` matrix from `As` into $A$ fragment registers, which is **four** `.m8n8` matrix loads. We then load a `16x8` matrix from `Bs` into $B$ fragment registers, which is **two** `.m8n8` matrix loads.
+
+- **In some situations, not all threads are responsible for providing the values of `.p`**
+
+Depending on the value of `.num`, every group of eight threads provides eight addresses where each address corresponds to *the start of a matrix **row*** (see the following table; we'll look into what "matrix rows" mean in the next key point). This means that if `.num` is .`x2`, only the first 16 threads in a warp provide addresses 0 - 15. Based on my experience, it seems that the instruction would just ignore whatever addresses passed by the rest of the threads.
+
+![The addresses provided by the corresponding groups of threads in ldmatrix.](/assets/images/2025-11-10-gemm/kernel13_ldmatrix.png)
+<p style="text-align: center;"><i>The addresses provided by the corresponding groups of threads in <code>ldmatrix</code>; table taken from <a href="https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-instructions-ldmatrix">PTX ISA</a></i></p>
+
+- **The shared memory addresses the participating threads need to supply are based on the layout of the fragments**
+
+How one or more `.m8n8` matrix loads are arranged relative to one another determines the address that each participating thread needs to provide. For example, the arrangement of four `.m8n8` matrix loads for `16x16` $A$ fragment and two `.m8n8` matrix loads for `16x8` $B$ fragment are illustrated below.
+
+![A fragment layout](/assets/images/2025-11-10-gemm/kernel13_start_addr.png)
+<p style="text-align: center;"><i>$A$ fragment layout.</i></p>
+
+The starting address of each row in `As` can then be computed as follows.
+
+```c++
+// Note that in the Github code, the computations below are combined.
+As_mma_tile_row_offset = warp_row_offset + mma_row_idx * MMA_M;
+As_mma_tile_col_offset = mma_k_offset;
+
+As_fragment_row_idx = lane_idx % MMA_M; // MMA_M is 16 in m16n8k16.
+As_fragment_col_idx = (lane_idx / MMA_M) * 8; 
+
+As_starting_address_row_idx = As_mma_tile_row_offset + As_fragment_row_idx;
+As_starting_address_col_idx = As_mma_tile_col_offset + As_fragment_col_idx;
+```
+
+Note that since the state space of the address is `.shared`, [the **64-bit** (generic) CUDA C++ pointer to `As` will need to be converted into the **32-bit** PTX shared state space](https://forums.developer.nvidia.com/t/why-do-i-need-to-convert-a-pointer-to-shared-address-space-before-using-the-ldmatrix-instruction/274466), hence, the following code is added:
+
+```c++
+uint32_t shared_A_pointer = static_cast<uint32_t>(
+    __cvta_generic_to_shared(&As[As_starting_address_row_idx * BK + As_starting_address_col_idx]));
+```
+
+Similarly, the pointer to `Bs` can be computed as follows.
+
+```c++
+// Note that in the Github code, the computations below are combined.
+Bs_mma_tile_row_offset = mma_k_offset;
+Bs_mma_tile_col_offset = warp_col_offset + mma_col_idx * MMA_N;
+
+Bs_fragment_row_idx = lane_idx % MMA_K;
+Bs_fragment_col_idx = 0;
+
+Bs_starting_address_row_idx = Bs_mma_tile_row_offset + Bs_fragment_row_idx;
+Bs_starting_address_col_idx = Bs_mma_tile_col_offset + Bs_fragment_col_idx;
+
+uint32_t shared_B_pointer = static_cast<uint32_t>(
+    __cvta_generic_to_shared(&Bs[Bs_starting_address_row_idx * BN + Bs_starting_address_col_idx]));
+```
+
+- **Each thread needs to allocate and provide destination registers `r`**
+
+Unlike how we can use the `fragment` class in wmma, we need to create our own fragment registers when using mma directly. The number of elements each thread needs to store in the $A$ and $B$ fragment registers is listed in the [PTX documentation](https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-fragment-mma-16816-float).
+
+According to the documentation for BFloat16-based `m16n8k16` matrix, the multiplicand $A$ fragment holds "four `.f16x2` registers, with each register containing two `.bf16` elements from the matrix $A$". An initial approach, therefore, would be to define the following registers:
+
+```c++
+__nv_bfloat16 A_register[8];
+```
+
+However, [the CUDA device compiler does not automatically pack two 16-bit data types into a single 32-bit register](https://forums.developer.nvidia.com/t/n-x-n-register-array-of-16-bit-dattype-how-much-registers-does-it-actually-occupy/34871?utm_source=chatgpt.com). So to ensure that the 16-bit `.bf16` elements are packed consecutively, we use 32-bit-based registers instead:
+
+```c++
+// We now need 8 * 16 / 32 = 4 elements per 32-bit register.
+uint32_t A_register[4];
+```
+
+Using the same approach, we define the following $B$ fragment registers:
+
+```c++
+uint32_t B_register[2];
+```
+
+We then can pass these registers as destination registers in the `ldmatrix` instruction.
+
+*Which registers hold which elements in the fragment matrix?* This is where the fragment layouts shown in the PTX ISA documentation come into place. Let's look at the `m16n8k16` matrix $A$ fragment layout.
+
+![A fragment layout](/assets/images/2025-11-10-gemm/kernel13_a_frag_layout.png)
+<p style="text-align: center;"><i>$A$ fragment layout for <code>m16n8k16</code> matrix size.</i></p>
+
+As we can see from the figure above, each thread holds eight `.bf16` elements, with every two `.bf16` elements packed into a single `.bf16x2` register. For instance, thread 0 stores the elements at coordinates `[[0, 0], [0, 1], [8, 0], [8, 1], [0, 8], [0, 9], [8, 8], [8, 9]]`.
+
+The packing and distribution of these elements are handled automatically by `ldmatrix`. For example, if we specify `"=r"(A_register[0]), "=r"(A_register[1]), "=r"(A_register[2]), "=r"(A_register[3])` as the destination registers, then `A_register[0]` will hold values `a0` and `a1`, `A_register[1]` will hold `a2` and `a3`, `A_register[2]` will hold `a4` and `a5`, and `A_register[3]` will hold `a6` and `a7`.
+
+We then repeat the same process for the $B$ fragment. The only additional detail is the `.trans` modifier, which transposes the matrix during loading since the $B$  fragment is stored in column-major order.
+
+
+**Summary**
+
+Overall, we'll have the following instruction:
+
+![ldmatrix instruction](/assets/images/2025-11-10-gemm/kernel13_instruction.png)
+<p style="text-align: center;"><i>The final ldmatrix instructions for m16n8k16 matrix size with BFloat16 data types.</i></p>
+
+**2\. Performing matrix multiplication**
+
+We've now gotten passed the most complicated part (at least in my opinion, `ldmatrix` is the most complex instruction to understand!).
+
+Performing matrix multiplication for our problem is pretty straightforward. We simply use `mma.sync` and pass along our registers:
+
+![mma.sync instruction](/assets/images/2025-11-10-gemm/kernel13_instruction_2.png)
+<p style="text-align: center;"><i>The mma.sync instruction for m16n8k16 matrix size with BFloat16 data types.</i></p>  
+
+And that's it!
+
+**3\. Epilogue and output stores**
+
+As with the wmma APIs, we need to apply $\alpha$ and $\beta$ manually here as well. At this stage, `acc_frag` already contains the accumulated dot products produced by `mma.sync`. All that remains is to extract the values from `acc_frag`, load the corresponding values from $C$, perform the final computation, and write the results back to $C$.
+
+Note that we can't use `ldmatrix` or `stmatrix` here since both instructions currently do not support 32-bit data transfer.
+
+We need pay close attention to the layout of elements within the accumulator fragment here.
+
+![Accumulator fragment layout](/assets/images/2025-11-10-gemm/kernel13_acc_frag_layout.png)
+<p style="text-align: center;"><i>The accumulator fragment layout for <code>m16n8k16</code> matrix size.</i></p>
+
+Based on the layout shown above, each thread holds four `.f32` elements, with every two elements grouped and stored consecutively. To obtain the corresponding fragment row and column indices for each thread, we can compute them as shown in the following code. Since the elements are already paired, we can also vectorize the loads and stores using `float2`.
+
+```c++
+uint const fragment_row_offset{lane_idx / 4};
+uint const fragment_col_offset{(lane_idx % 4) * 2};
+```
+
+The rest of the code should be straightforward:
+
+```c++
+// Load elements from C.
+reinterpret_cast<float2 *>(&C_register[0])[0] =
+    reinterpret_cast<float2 *>(&C_pointer[fragment_row_offset * N + fragment_col_offset])[0];
+reinterpret_cast<float2 *>(&C_register[2])[0] =
+    reinterpret_cast<float2 *>(&C_pointer[(fragment_row_offset + 8) * N + fragment_col_offset])[0];
+
+// Compute alpha * (AB) + beta * C.
+C_register[0] = acc_register[mma_row_idx][mma_col_idx][0] * alpha + C_register[0] * beta;
+C_register[1] = acc_register[mma_row_idx][mma_col_idx][1] * alpha + C_register[1] * beta;
+C_register[2] = acc_register[mma_row_idx][mma_col_idx][2] * alpha + C_register[2] * beta;
+C_register[3] = acc_register[mma_row_idx][mma_col_idx][3] * alpha + C_register[3] * beta;
+
+// Store outputs back to C.
+reinterpret_cast<float2 *>(&C_pointer[fragment_row_offset * N + fragment_col_offset])[0] =
+    reinterpret_cast<float2 *>(&C_register[0])[0];
+reinterpret_cast<float2 *>(&C_pointer[(fragment_row_offset + 8) * N + fragment_col_offset])[0] =
+    reinterpret_cast<float2 *>(&C_register[2])[0];
+```
+
+Unfortunately, we can't directly compare the performance with Kernel 09 given the different supported matrix sizes. But using `mma` instructions along with shared-memory stores from Kernel 10 already yields a promising throughput of 76.93 TFLOPs/s.
+
+| Kernel # | Performance (TFLOPs/s) | % cuBLAS performance |
+|:---|:---:|:---:|:---:|
+| cuBLAS | 88.81 | 100% |
+| kernel 06: warp tiling, subdivided | 27.23 | 30.66% |
+| kernel 09: tensor cores (wmma API) | 65.38 | 73.62% |
+| kernel 10: tensor cores + async gmem loads  | 73.77 | 83.06% |
+| kernel 11: tensor cores + double buffering | 80.33 | 90.45% |
+| kernel 12: tensor cores + three-level pipeline | 87.13 | 98.11% |
+| kernel 13: tensor cores (mma) 🆕 | 76.93 | 86.62% |
+
+<!-- START OF DIV -->
+<div class="div-author-note">
+<h4>Author's Note</h4>
+I highly recommend reading the <a href="https://docs.nvidia.com/cuda/inline-ptx-assembly/index.html">Using Inline PTX Assembly in CUDA</a> documentation to become familiar with the syntax and related details.
+</div>
+<!-- END OF DIV -->
+
+#### Kernel 14 & 15: Swizzled shared memory + three-level pipeline
+
+We discussed briefly about shared memory bank conflicts when implementing Kernel 07 (transpose `As`). 
 
 # PTX
-
-```
-wmma.load.a.sync.aligned.layout.shape{.ss}.atype r, [p] {, stride}
-wmma.load.b.sync.aligned.layout.shape{.ss}.btype r, [p] {, stride}
-wmma.load.c.sync.aligned.layout.shape{.ss}.ctype r, [p] {, stride}
-.layout = {.row, .col};
-.shape  = {.m16n16k16, .m8n32k16, .m32n8k16};
-.ss     = {.global, .shared{::cta}};
-.atype  = {.bf16 };
-.btype  = {.bf16 };
-.ctype  = {.f32 };
-```
 
 - How to replace p (address operand)?
 - How to replace r (register)?
