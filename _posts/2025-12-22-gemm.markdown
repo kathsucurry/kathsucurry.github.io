@@ -1855,3 +1855,5 @@ Overall, this post focuses on optimizing both SGEMM and HGEMM. For matrices of s
 **Others**
 
 - A significant number of questions and answers on the NVIDIA developer forums, where the majority were contributed by Robert Crovella.
+- Illustrations were drawn with [Excalidraw](https://excalidraw.com).
+- [Godbolt](https://godbolt.org) was used for sharing and viewing PTX instructions.

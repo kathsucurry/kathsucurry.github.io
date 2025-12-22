@@ -3,6 +3,7 @@ layout: post
 title:  "Reduction (Sum): part 1 | Introduction"
 date:   2025-10-14
 categories: cuda
+katex: true
 ---
 
 In this series, we will explore how to implement parallel sum reduction using CUDA. We'll begin with an introductory post covering the following key topics:
@@ -22,7 +23,7 @@ We'll then dive into the implementation details and optimization techniques for 
 # 1. What is sum reduction, and how can we parallelize it?
 
 
-Given a list of elements, reduction applies an operation on each of the elements and accumulates them into one single value--hence, the term "reduce". In the case of sum reduction, the operation sums all the elements together, outputting the final sum value. For instance, with a list of length 8 containing the elements `[1, 2, 3, 4, 5, 6, 7, 8]`, the sum reduction output would be `1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 = 36`. Other reduction operations include, but are not limited to, `max`, `min`, and `mean`. 
+Given a list of elements, reduction applies an operation on each of the elements and accumulates them into one single value, hence, the term "reduce". In the case of sum reduction, the operation sums all the elements together, outputting the final sum value. For instance, with a list of length 8 containing the elements `[1, 2, 3, 4, 5, 6, 7, 8]`, the sum reduction output would be `1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 = 36`. Other reduction operations include, but are not limited to, `max`, `min`, and `mean`. 
 
 To implement sum reduction, the most naive way is to add the elements sequentially:
 
@@ -43,7 +44,7 @@ The above solution requires 8 time steps to complete, and this `O(N)` approach d
 
 Compared to the 8 time steps in the sequential approach, it now only requires 3 time steps: 4 sum operations in the first step, 2 sum operations in the second step, and one final sum operation in the third step.
 
-Note that here, we assume sufficient resources to perform all 4 sum operations simultaneously. In practice, however, often the data is so large that we need to break the computations into multiple batches, with each batch handled by a separate thread block. Once we obtain the partial sum from each batch, we then invoke the reduction kernel one more time--this time with a single block--to compute the final sum. 
+Note that here, we assume sufficient resources to perform all 4 sum operations simultaneously. In practice, however, often the data is so large that we need to break the computations into multiple batches, with each batch handled by a separate thread block. Once we obtain the partial sum from each batch, we then invoke the reduction kernel one more time *with a single block* to compute the final sum. 
 
 The figure below illustrates this process: the kernel is first launched with 8 blocks to compute 8 partial sums from the input elements. These partial sums are then passed to a second kernel launch, now using a single block, to produce the final result.
 
@@ -53,7 +54,7 @@ The figure below illustrates this process: the kernel is first launched with 8 b
 
 # 2. Choosing memory bandwidth as the metric
 
-Reduction is an example of memory-bound kernels: for each element loaded, only one floating-point operation is performed. In such cases, optimizing memory access efficiency becomes the priority where we strive to *reach* the GPU peak bandwidth. In contrast, compute-bound kernels--such as matrix multiplication--are limited by arithmetic intensity rather than memory access. We will look into matrix multiplication in a future post.
+Reduction is an example of memory-bound kernels: for each element loaded, only one floating-point operation is performed. In such cases, optimizing memory access efficiency becomes the priority where we strive to *reach* the GPU peak bandwidth. In contrast, compute-bound kernels, such as matrix multiplication, are limited by arithmetic intensity rather than memory access. We will look into matrix multiplication in a future post.
 
 ### What is my GPU peak memory bandwidth?
 
@@ -85,9 +86,12 @@ float const peak_bandwidth{static_cast<float>(2.0f * memory_clock_hz * memory_bu
 
 In brief, we aim to *reach* for the GPU peak memory bandwidth (896 GB/s on RTX 5070 Ti) in our optimization efforts.
 
-> 📝 **Note**
->
-> Notice the use of word "reach" rather than "achieve" here. The peak memory bandwidth is a theoretical maximum and typically cannot be fully realized in practice due to various overheads.
+<!-- START OF DIV -->
+<div class="div-author-note">
+<h4>Author's Note</h4>
+Notice the use of word "reach" rather than "achieve" here. The peak memory bandwidth is a theoretical maximum and typically cannot be fully realized in practice due to various overheads.
+</div>
+<!-- END OF DIV -->
 
 
 # 3. Utilizing shared memory
@@ -100,14 +104,19 @@ However, accessing global memory is slow, so having to access it so many times i
 
 Shared memory resides on-chip, giving it significantly higher throughput compared to global memory, which is located in the GPU's off-chip DRAM. Shared memory is allocated per thread blocks, which means that all threads within a block can access the same shared memory variables. However, it has a much lower capacity compared to global memory; depending on how much shared memory each block requires, it may limit the number of blocks that can be placed on each Streaming Multiprocessor (SM). You can read more about shared memory [here](https://developer.nvidia.com/blog/using-shared-memory-cuda-cc/).
 
-> 📝 **Note**
->
-> ["How CUDA Programming Works" presentation by Stephen Jones](https://www.nvidia.com/en-us/on-demand/session/gtcfall22-a41101/) provides a really good explanation of how the resources required by each thread block--such as shared memory-- affect the number of blocks that can be scheduled on each SM. The slide below, taken from the presentation, illustrates an example of this.
+<!-- START OF DIV -->
+<div class="div-author-note">
+<h4>Author's Note</h4>
+<a href="https://www.nvidia.com/en-us/on-demand/session/gtcfall22-a41101/">"How CUDA Programming Works" presentation by Stephen Jones</a> provides a really good explanation of how the resources required by each thread block, such as shared memory, affect the number of blocks that can be scheduled on each SM. The slide below, taken from the presentation, illustrates an example of this.
+<br />
 
->
-> ![image How the GPU places blocks on an SM](/assets/images/2025-10-27-reduction_sum_part2/fig0_sm_allocation.png)
->
-> Given the block resource requirements (shown in the table on the right), we can see that the GPU is unable to place **Block 3** due to the insufficient remaining shared memory. Since 3 blocks have already been placed (`3 * 48 kB = 144 kB`), only `160 kB - 144 kB = 16 kB` of shared memory capacity remains, which is insufficient for another block that requires `48 kB`.
+<div style="margin-top: 20px;">
+    <img src="/assets/images/2025-10-27-reduction_sum_part2/fig0_sm_allocation.png" alt="How the GPU places blocks on an SM.">
+</div>
+<br />
+Given the block resource requirements (shown in the table on the right), we can see that the GPU is unable to place <b>Block 3</b> due to the insufficient remaining shared memory. Since 3 blocks have already been placed ($3 \times 48\ kB = 144\ kB$), only $160\ kB - 144\ kB = 16\ kB$ of shared memory capacity remains, which is insufficient for another block that requires 48 kB.
+</div>
+<!-- END OF DIV -->
 
 We will use shared memory in all of the sum reduction implementations discussed in [Part 2]({% link _posts/2025-10-27-reduction_sum_part2.markdown %}). For example, the first few implementations require `# threads per block * sizeof(float)` bytes of shared memory per thread block, so that each thread has its own slot.
 
@@ -115,9 +124,9 @@ We will use shared memory in all of the sum reduction implementations discussed 
 
 I used and slightly modified [Lei Mao's reduction code setting](https://leimao.github.io/blog/CUDA-Reduction/) as follows.
 
-1. **Error handling, output verification, and performance measurement**:  I include error handling (`CHECK_CUDA_ERROR()` and `CHECK_LAST_CUDA_ERROR()`), kernel output verification (within `profile_batched_kernel()`), and performance measurement (`measure_performance_in_ms`), with minor variable/function renaming based on personal preferences. All of this can be found in [`utils.cuh`](https://github.com/kathsucurry/cuda_reduction_sum/blob/main/src/utils.cuh).
+1. **Error handling, output verification, and performance measurement**:  I include error handling (`CHECK_CUDA_ERROR()` and `CHECK_LAST_CUDA_ERROR()`), kernel output verification (within `profile_batched_kernel()`), and performance measurement (`measure_performance_in_ms`), with minor variable/function renaming based on personal preferences. They can be found in [`utils.cuh`](https://github.com/kathsucurry/cuda_reduction_sum/blob/main/src/utils.cuh).
 2. **Cache flush kernel**: To ensure accurate benchmarking when running the reduction kernels on smaller datasets, I included [a cache-flush kernel](https://github.com/kathsucurry/cuda_reduction_sum/blob/main/src/utils.cuh#L49). This prevents inflated effective memory bandwidth caused by repeated runs benefiting from cached data.
-3. **Improved memory management**: instead of allocating, freeing, and reallocating device memory for each kernel invocation, I now allocate and free memory once in `main()` (see [`run_kernel.cu`](https://github.com/kathsucurry/cuda_reduction_sum/blob/main/run_kernel.cu)). This reduces overhead and speeds up the overall process--without affecting the kernel performance.
+3. **Improved memory management**: instead of allocating, freeing, and reallocating device memory for each kernel invocation, I now allocate and free memory once in `main()` (see [`run_kernel.cu`](https://github.com/kathsucurry/cuda_reduction_sum/blob/main/run_kernel.cu)). This reduces overhead and speeds up the overall process without affecting the kernel performance.
 4. **Kernel organization**: all kernel implementations are located in the [`kernels` directory](https://github.com/kathsucurry/cuda_reduction_sum/tree/main/src/kernels). This organization was inspired by [Simon's matmul kernel optimization repo](https://github.com/siboehm/SGEMM_CUDA).
 
 
@@ -156,11 +165,15 @@ The steps above can be found in `measure_performance_in_ms()` [function](https:/
 
 We have a list of 2<sup>29</sup> = 536,870,912 floating-point elements. The length itself was chosen arbitrarily, as long as it's large enough and is also divisible by 1024.
 
-> ⚠️ **Caution** ⚠️
->
-> Since the length is divisible by 1024, **we don't include any boundary check** in any of the kernel implementations for simplicity. In real-world applications, however, **boundary checks are essential** to prevent out-of-bounds memory access, which can lead to undefined behavior or crashes.
+<!-- START OF DIV -->
+<div class="div-warning">
+<h4>🚨 CAUTION 🚨</h4>
 
-The elements in [Lei Mao's post](https://leimao.github.io/blog/CUDA-Reduction/) are all set to a constant value `1.0f`, which significantly speeds up verification, as the expected partial sum for each batch is simply the number of elements in the batch multiplied by the constant. However, I found that this problem setup is prone to a specific bug: incorrect shifting of the input list when running the kernel, which can go unnotized because all elements are identical. To address this, I created two subclasses of `Elements`, each differing in how they initialize values and perform verification:
+Since the length is divisible by 1024, <b>we don't include any boundary check</b> in any of the kernel implementations for simplicity. In real-world applications, however, <b>boundary checks are essential</b> to prevent out-of-bounds memory access, which can lead to undefined behavior or crashes.
+</div>
+<!-- END OF DIV -->
+
+The elements in [Lei Mao's post](https://leimao.github.io/blog/CUDA-Reduction/) are all set to a constant value `1.0f`. It significantly speeds up verification as the expected partial sum for each batch is simply the number of elements in the batch multiplied by the constant. However, I found that this problem setup is prone to a specific bug: incorrect shifting of the input list when running the kernel, which can go unnotized because all elements are identical. To address this, I created two subclasses of `Elements`, each differing in how they initialize values and perform verification:
 
 1. `RandomElements`: initializes each element with a random floating-point value. During the verification, the partial sum of each batch is compared against the CPU-computed sum. This approach provides better test coverage but may be slower due to the large input size.
 
