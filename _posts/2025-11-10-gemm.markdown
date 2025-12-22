@@ -24,7 +24,7 @@ This post is organized into the following sections:
     - [**Kernel 04: Vectorized memory access**](#kernel-04-vectorized-memory-access)
     - [**Kernel 05: Warp tiling**](#kernel-05-warp-tiling)
     - [**Kernel 06: Warp tiling, subdivided**](#kernel-06-warp-tiling-subdivided)
-    - [**Kernel 07: Transpose `As`**](#kernel-07-transpose-as)
+    - [**Kernel 07: Transposing `As`**](#kernel-07-transposing-as)
     - [**Kernel 08: Asynchronous global-memory loads + double buffering**](#kernel-08-asynchronous-global-memory-loads--double-buffering)
 5. [**Tensor cores**](#5-tensor-cores)
 6. [**Half-precision GEMM implementation**](#6-half-precision-gemm-implementations)
@@ -33,7 +33,7 @@ This post is organized into the following sections:
     - [**Kernel 12: Tensor cores + three-level pipeline**](#kernel-12-tensor-cores--three-level-pipeline)
     - [**Kernel 13: Tensor cores (mma instructions)**](#kernel-13-tensor-cores-mma-instructions)
     - [**Kernel 14 & 15: Swizzled shared memory + three-level pipeline**](#kernel-14--15-swizzled-shared-memory--three-level-pipeline)
-6. **Summary**
+6. [**Summary**](#7-summary)
 
 <hr class="hr-top" /><hr />
 
@@ -197,7 +197,7 @@ In this post, we will look into the following implementations:
 4. [**Kernel 04: Vectorized memory access**](#kernel-04-vectorized-memory-access)
 5. [**Kernel 05: Warp tiling**](#kernel-05-warp-tiling)
 6. [**Kernel 06: Warp tiling, subdivided**](#kernel-06-warp-tiling-subdivided)
-7. [**Kernel 07: Transpose `As`**](#kernel-07-transpose-as)
+7. [**Kernel 07: Transposing `As`**](#kernel-07-transposing-as)
 8. [**Kernel 08: Asynchronous global-memory loads + double buffering**](#kernel-08-asynchronous-global-memory-loads--double-buffering)
 
 <!-- START OF DIV -->
@@ -922,7 +922,7 @@ However, a larger `WNITER` does not always guarantee better performance. One pos
 
 <hr />
 
-#### Kernel 07: Transpose `As`
+#### Kernel 07: Transposing `As`
 
 One optimization recommended in Simon's post is to vectorize the shared-memory loads as well. Vectorizing the loads from `Bs` is straightforward because `Bs` is always accessed horizontally. In contrast, vectorizing the loads from `As` requires transposing `As` since its elements are currenty loaded vertically.
 
@@ -978,7 +978,7 @@ Overall, transposing `As` leads to a noticeable improvement compared to Kernel 0
 | kernel 04: vectorized memory access | 26.16 TFLOPs/s | 82.63% |
 | kernel 05: warp tiling | 26.19 TFLOPs/s | 82.72% |
 | kernel 06: warp tiling, subdivided | 28.70 TFLOPs/s | 90.65% |
-| kernel 07: transpose `As` 🆕 | 29.71 TFLOPs/s | 93.84% |
+| kernel 07: transposing `As` 🆕 | 29.71 TFLOPs/s | 93.84% |
 
 <!-- START OF DIV -->
 <div class="div-author-note">
@@ -990,6 +990,8 @@ I did experiment with only vectorizing <code>Bs</code> loads in Kernel 06; it di
 *How does transposing `As` affect shared memory bank conflicts?*
 
 Recall that shared memory is divided into 32 equally-sized banks where each bank can handle a 4-byte load or store operation per clock cycle. Consecutive 4-byte words are assigned to consecutive banks, so in our case, each `float` element occupies one bank.
+
+Shared memory bank conflicts occur when *multiple threads in a warp* access *different addresses* that reside in the same bank. In such cases, the accesses must be serialized, reducing throughput by a factor equal to the number of conflicting requests. An *n*-way bank conflict means that *n* distinct memory requests from threads in a warp target the same bank.
 
 **`As` stores**
 
@@ -1117,7 +1119,7 @@ The updated performance table can be found below.
 | kernel 04: vectorized memory access | 26.16 | 82.63% |
 | kernel 05: warp tiling | 26.19 | 82.72% |
 | kernel 06: warp tiling, subdivided | 28.70 | 90.65% |
-| kernel 07: transpose `As` | 29.71 | 93.84% |
+| kernel 07: transposing `As` | 29.71 | 93.84% |
 | kernel 08: asynchronous copy + double buffering 🆕 | 30.28 | 95.64% |
 
 We have now reached approximately 96% of cuBLAS performance on single-precision GEMM!
@@ -1695,30 +1697,145 @@ Unfortunately, we can't directly compare the performance with Kernel 09 given th
 <!-- START OF DIV -->
 <div class="div-author-note">
 <h4>Author's Note</h4>
-I highly recommend reading the <a href="https://docs.nvidia.com/cuda/inline-ptx-assembly/index.html">Using Inline PTX Assembly in CUDA</a> documentation to become familiar with the syntax and related details.
+You can read the <a href="https://docs.nvidia.com/cuda/inline-ptx-assembly/index.html">Using Inline PTX Assembly in CUDA</a> documentation to become familiar with the syntax and related details.
 </div>
 <!-- END OF DIV -->
 
+<hr />
+
 #### Kernel 14 & 15: Swizzled shared memory + three-level pipeline
 
-We discussed briefly about shared memory bank conflicts when implementing Kernel 07 (transpose `As`). 
+We touched on shared memory bank conflicts briefly when implementing Kernel 07 (transposing `As`). As a reminder:
+- Shared memory is divided into 32 equally-sized banks, each bank can handle one 4-byte load or store operation per clock cycle. In our case, two BFloat16 elements share a single bank.
+- Bank conflicts happen when multiple threads in a warp access *different* addresses within the same bank in a single instruction.
+- An *n*-way bank conflict reduces throughput by a factor of *n*, so we want to minimize them whenever possible.
+- In some cases, it may not be possible to eliminate all bank conflicts; we will see examples of this in this section.
 
-# PTX
+Bank conflicts often occur because the number of columns in shared memory is usually a multiple of 32 and we typically want to access the elements within the same column. One way to reduce these conflicts is to **permute the elements in each row** so that consecutive accesses no longer target the same bank. This technique is known as **shared memory swizzling**. In this post, we will cover [the swizzle method from CUTLASS](https://github.com/NVIDIA/cutlass/blob/b0e09d7cd371eded41f7c1e057caf1593c27ba55/include/cute/swizzle.hpp#L55).
 
-- How to replace p (address operand)?
-- How to replace r (register)?
-- https://forums.developer.nvidia.com/t/n-x-n-register-array-of-16-bit-dattype-how-much-registers-does-it-actually-occupy/34871?utm_source=chatgpt.com (why we need to do reinterpret_cast)
-- 64-bit vs 32-bit https://forums.developer.nvidia.com/t/why-do-i-need-to-convert-a-pointer-to-shared-address-space-before-using-the-ldmatrix-instruction/274466/2 
+The swizzle method from CUTLASS has only three parameters:
 
-- ldmatrix: Each address corresponds to the start of a matrix row
-- swizzling: permute WITHIN row + keeps 8 (or n) elements in each MMA tile row together
+1. **`BBits`** --> the number of bits in the bit mask. The mask is created as `(1 << BBits) - 1`. For example, `BBits = 3` would produce a bit mask of `..00111`.
+2. **`MBase`** --> the number of least significant bits we want to keep constant. This is useful when a group of elements must stay together, i.e., the order of the elements within the group always remain the same.
+3. **`SShift`** --> the distance to shift the `YYY mask`, defined as `yyy_mask = bit_mask << (MBase + SShift)`. For simplicity, we only consider positive values of `SShift`.
+
+Given an offset (or an index to permute), we perform the following operation:
+
+```c++
+swizzed_offset = offset ^ ((offset & yyy_mask) >> SShift);
+```
+
+*How do we determine the values of the parameters?*
+
+The value of `MBase` is determined by:
+
+$$
+log_{2}(number\ of\ elements\ that\ must\ stay\ together).
+$$
+
+For example, when vectorizing loads or stores of 2-byte elements using a `float4`, we need to keep eight elements contiguous. In this case, `MBase`$= log_{2}(8) = 3$. As another example, when using `ldmatrix` to load fragments, `MBase` is set to $log_{2}(8) = 3$ since each `.m8n8` matrix row contains 8 elements.
+
+`BBits` is defined as
+
+$$
+log_{2}(number\ of\ elements\ (or\ groups\ of\ elements)\ to\ be\ permuted).
+$$
+
+The total size of the elements (or element groups) being permuted must span all 32 shared-memory banks. For example, if we permute 32 individual 4-byte elements, then `BBits` would be $log_{2}(32) = 5$. If, instead, four 4-byte elements must stay together (i.e., `MBase = 2`), then those 32 elements are organized into eight groups. In this case, we permute eight groups, so `BBits` $= log_{2}(8) = 3$.
+
+Finally, `SShift` is defined as
+
+$$
+log_{2}(number\ of\ elements\ spanning\ all\ 32\ banks) - MBase
+$$
+
+The number of 2-byte and 4-byte elements spanning all 32 shared-memory banks would be 64 and 32, respectively.
+
+**A toy example**
+
+Let's walk through a simple example: say we have a 32 x 32 matrix of `float` (4-byte) elements stored in shared memory. The figure below illustrates the bank indices the elements are mapped to.
+
+![Swizzle toy example: original bank indices](/assets/images/2025-11-10-gemm/kernel14_example_before.png)
+<p style="text-align: center;"><i>A toy example: the indices of the shared memory bank each element is mapped to.</i></p>
+
+In a toy kernel, suppose each warp accesses an entire row of the matrix: for warp 0, thread 0 accesses the element at $[0, 0]$, thread 1 accesses $[1, 0]$, and so on. Because all of these accesses map to the same shared-memory bank, this results in a 32-way bank conflict. To avoid this, we apply a swizzle to the matrix layout.
+
+In this case, there is no need to group elements together, so we set `MBase = 0`. Each row contains 32 elements that need to be permuted while keeping the row index unchanged. That means we only need to permute the 5 least significant bits of the column index (since $2^5 =32$), so we set `BBits = 5`.
+
+Finally, 32 elements span all 32 banks, so the value of `SShift` would be $log_{2}(32) - 0 = 5$.
+
+Using `Mbase = 0, BBits = 5, SShift = 5` parameters results in the following updated bank indices.
+
+![Swizzle toy example: updated bank indices](/assets/images/2025-11-10-gemm/kernel14_example_after.png)
+<p style="text-align: center;"><i>A toy example: the <i>updated</i> indices of the shared memory bank each element is mapped to.</i></p>
+
+All elements in each row is now mapped to different banks, which eliminates bank conflicts.
+
+**`As` data loads**
+
+For 2-byte elements, 64 elements span all 32 shared-memory banks. As part of the `ldmatrix` operation, a group of four consecutive threads collectively loads 16 bytes when reading an 8x8 matrix. This implies that eight 2-byte elements must remain contiguous. As a result, the 64 elements are organized into $64 / 8 = 8$ groups to be permuted.
+
+Accordingly, we set `MBase` $= log_{2}(8) = 3$, `BBits` $=log_{2}(8) = 3$, and `SShift` $= log_{2}(64) - $ `Mbase` $= 3$.
+
+If only a single 8x8 matrix is loaded, the swizzle is sufficient to eliminate bank conflicts. However, as the number of 8x8 matrices loaded per instruction increases, bank conflicts become unavoidable since the banks must be reused with the additional elements to load. Specifically, using `.num` = `.x2` results in 2-way bank conflicts even with the swizzle applied, while `.num` = `.x4` leads to 4-way bank conflicts, matching the level of conflict observed without any swizzling.
+
+![Original bank indices the elements of As are mapped to](/assets/images/2025-11-10-gemm/kernel14_as_before.png)
+<p style="text-align: center;"><i>The original bank indices the elements of <code>As</code> are mapped to where the four 8x8 matrices loaded by <code>ldmatrix</code> lead to 4-way bank conflicts.</i></p>
+
+Since swizzling does not reduce bank conflicts in this case, we do not apply it to `As`.
+
+**`Bs` data loads**
+
+In the current configuration, `Bs` has dimensions $16 \times 128$, which means that loading two 8x8 matrices leads to 16-way bank conflicts. By applying the same swizzle parameters discussed in the As data loads section (`MBase` = 3, `BBits` = 3, and `SShift` = 3), we are able to reduce these conflicts to just 2-way bank conflicts.
+
+![Bank indices in Bs](/assets/images/2025-11-10-gemm/kernel14_bs.png)
+<p style="text-align: center;"><i>The original and the swizzled bank indices the elements in <code>Bs</code> are mapped to. The swizzle method reduces the bank conflicts from 16-way to 2-way.</i></p>
+
+**Summary**
+
+Applying the swizzle configuration to `Bs` boosts throughput to 84.24 TFLOPs/s, and incorporating the three-level pipelining technique from Kernel 12 further increases it to 90.31 TFLOPs/s, exceeding 100% of cuBLAS performance!
+
+| Kernel # | Performance (TFLOPs/s) | % cuBLAS performance |
+|:---|:---:|:---:|:---:|
+| cuBLAS | 88.81 | 100% |
+| kernel 06: warp tiling, subdivided | 27.23 | 30.66% |
+| kernel 09: tensor cores (wmma API) | 65.38 | 73.62% |
+| kernel 10: tensor cores + async gmem loads  | 73.77 | 83.06% |
+| kernel 11: tensor cores + double buffering | 80.33 | 90.45% |
+| kernel 12: tensor cores + three-level pipeline | 87.13 | 98.11% |
+| kernel 13: tensor cores (mma) | 76.93 | 86.62% |
+| kernel 14: tensor cores (mma) swizzled 🆕 | 84.24 | 94.85% |
+| kernel 15: tensor cores (mma) swizzled + three-level pipeline 🆕 | 90.31 | 101.69% |
+
+<hr class="hr-top" /><hr />
+
+# 7. Summary
+
+My original goal was simply to learn from Simon's post and implement a single tensor-core-based kernel, so I did not expect to end up exploring many additional techniques such as swizzling and pipelining. In practice, wrapping my head around warp tiling (especially the subdivided variant), along with understanding how to use `mma` instructions and apply swizzling, required a significant amount of effort. I'm glad I was able to work through and cover these topics. If you notice any mistakes, issues, or have any feedback at all, I would love to hear it!
+
+Note that I did not perform extensive parameter tuning. Instead, I experimented with a limited number of configurations and selected one that produced reasonable good performance for the chosen values of $M$, $N$, and $K$. The same configuration is unlikely to be optimal for other matrix shapes.
+
+Overall, this post focuses on optimizing both SGEMM and HGEMM. For matrices of size $M = N = K = 4096$, we achieve approximately **95% of cuBLAS performance for SGEMM** and **101% of cuBLAS performance for HGEMM**.
+
+<hr class="hr-top" /><hr />
 
 # Resources
 
+**Matrix multiplication optimization posts**
+
 - [How to Optimize a CUDA Matmul Kernel for cuBLAS-like Performance: a Worklog](https://siboehm.com/articles/22/CUDA-MMM) by Simon Boehm (2022).
+- [How To Write A Fast Matrix Multiplication From Scratch With Tensor Cores](https://alexarmbr.github.io/2024/08/10/How-To-Write-A-Fast-Matrix-Multiplication-From-Scratch-With-Tensor-Cores.html#performance-on-different-matrix-sizes) by Alex Armbruster (2024).
+
+**Optimization concepts and techniques**
+
 - [Understanding the Roofline Model](https://accelerated-computing.academy/fall25/resources/roofline/) taken from MIT 6.S894: Accelerated Computing Resources page
-- [CUDA C++ Programming Guide](https://docs.nvidia.com/cuda/cuda-c-programming-guide)
-- PTX ISA
-- PTX inline documentation
 - Asynchronous Data Copies section, [Advanced Performance Optimization in CUDA](https://www.nvidia.com/en-us/on-demand/session/gtc24-s62192/) by Igor Terentyev (2024).
-- https://docs.nvidia.com/deeplearning/performance/dl-performance-gpu-background/index.html#gpu-arch
+- [CuTe Swizzle](https://www.google.com/search?client=safari&rls=en&q=swizzle+in+cutlass&ie=UTF-8&oe=UTF-8) by Lei Mao (2024).
+- [NVIDIA Tensor Core Programming](https://leimao.github.io/blog/NVIDIA-Tensor-Core-Programming/) by Lei Mao (2023).
+- HGEMM example code: [Toy-HGEMM](https://github.com/xlite-dev/HGEMM) by DefTruth.
+
+**Documentation**
+
+- [CUDA C++ Programming Guide](https://docs.nvidia.com/cuda/cuda-c-programming-guide)
+- [Parallel Thread Execution ISA](https://docs.nvidia.com/cuda/parallel-thread-execution/)
+- [Inline PTX Assembly in CUDA](https://www.google.com/search?client=safari&rls=en&q=ptx+inline+documentation&ie=UTF-8&oe=UTF-8)
