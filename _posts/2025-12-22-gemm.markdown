@@ -1,14 +1,16 @@
 ---
 layout: post
-title:  "GEMM"
-date:   2025-11-10
+title:  "Optimizing SGEMM and HGEMM: Achieving >95% of cuBLAS Performance"
+date:   2025-12-22
 categories: cuda
 katex: true
 ---
 
 It's widely known that implementing and optimizing GEMM (**GE**neral **M**atrix **M**ultiplication) is fundamental when it comes to learning GPU programming. In this post, we'll walk through the process of implementing and optimizing single-precision and half-precision GEMM: from a brief overview of what the operation does to advanced optimizations using Tensor Cores.
 
-I'll primarily use [Simon's](https://siboehm.com/articles/22/CUDA-MMM) and [Alex's](https://alexarmbr.github.io/2024/08/10/How-To-Write-A-Fast-Matrix-Multiplication-From-Scratch-With-Tensor-Cores.html#how-to-use-tensor-cores) GEMM posts as the foundation. Specifically, I'll start with reimplementing the kernels from both posts and documenting the insights I gain along the way. My goal is not to replace any of their posts, but to solidify my own understanding of the different optimization techniques and to write a reference I can return to when needed in the future. 
+I primarily use [Simon's](https://siboehm.com/articles/22/CUDA-MMM) GEMM posts as the foundation for this work. I begin by reimplementing the kernels from Simon's post and documenting the insights I gain along the way. For Tensor Core-based optimizations, I draw heavily from the notes and explanations in [Alex's](https://alexarmbr.github.io/2024/08/10/How-To-Write-A-Fast-Matrix-Multiplication-From-Scratch-With-Tensor-Cores.html#how-to-use-tensor-cores) post. I've listed other extremely helpful resources in the [Resources](#resources) section as well.
+
+My goal is not to replace any of their posts, but to solidify my own understanding of the different optimization techniques and to write a reference I can return to when needed in the future. If you identify any issues or if you have any feedback at all, please do reach out to my email: `[last_name].[first_name][at]gmail[dot]com`; I would love to hear them!
 
 All performance measurements in this posts were taken on an RTX 5070 Ti and the implementation code can be found [here](https://github.com/kathsucurry/cuda_matrix_multiplication).
 
@@ -26,12 +28,12 @@ This post is organized into the following sections:
     - [**Kernel 06: Warp tiling, subdivided**](#kernel-06-warp-tiling-subdivided)
     - [**Kernel 07: Transposing `As`**](#kernel-07-transposing-as)
     - [**Kernel 08: Asynchronous global-memory loads + double buffering**](#kernel-08-asynchronous-global-memory-loads--double-buffering)
-5. [**Tensor cores**](#5-tensor-cores)
+5. [**Tensor Cores**](#5-tensor-cores)
 6. [**Half-precision GEMM implementation**](#6-half-precision-gemm-implementations)
-    - [**Kernel 09: Tensor cores (wmma API)**](#kernel-09-tensor-cores-wmma-api)
-    - [**Kernel 10 & 11: Tensor cores + asynchronous gmem loads + double buffering**](#kernel-10--11-tensor-cores--asynchronous-gmem-loads--double-buffering)
-    - [**Kernel 12: Tensor cores + three-level pipeline**](#kernel-12-tensor-cores--three-level-pipeline)
-    - [**Kernel 13: Tensor cores (mma instructions)**](#kernel-13-tensor-cores-mma-instructions)
+    - [**Kernel 09: Tensor Cores (wmma API)**](#kernel-09-tensor-cores-wmma-api)
+    - [**Kernel 10 & 11: Tensor Cores + asynchronous gmem loads + double buffering**](#kernel-10--11-tensor-cores--asynchronous-gmem-loads--double-buffering)
+    - [**Kernel 12: Tensor Cores + three-level pipeline**](#kernel-12-tensor-cores--three-level-pipeline)
+    - [**Kernel 13: Tensor Cores (mma instructions)**](#kernel-13-tensor-cores-mma-instructions)
     - [**Kernel 14 & 15: Swizzled shared memory + three-level pipeline**](#kernel-14--15-swizzled-shared-memory--three-level-pipeline)
 6. [**Summary**](#7-summary)
 
@@ -49,7 +51,7 @@ A standard matrix multiplication $AB$ is a case of GEMM where $\alpha = 1$ and $
 
 The matrix multiplication $AB$ by itself can be illustrated by the figure below.
 
-![image Matrix Multiplication](/assets/images/2025-11-10-gemm/intro_matmul.png)
+![image Matrix Multiplication](/assets/images/2025-12-22-gemm/intro_matmul.png)
 <p style="text-align: center;"><i>Matrix multiplication between $A$ (dimension: $M \times K$) and $B$ (dimension: $K \times N$), resulting in a matrix with dimension ($M \times N$).</i></p>
 
 To compute the value of `AB[y, x]`, with $y$ indicating the matrix row and $x$ indicating the matrix column, we perform a dot product between the entire row $y$ of $A$ and the entire column $x$ of $B$:
@@ -66,7 +68,7 @@ In my earlier [Reduction (Sum) post]({% link _posts/2025-10-14-reduction_sum_par
 
 The Roofline Model is designed to guide the optimization process by defining the *peak performance* achievable on a given hardware. It's typically visualized as a 2D plot, with **Operational Intensity** on the $x$-axis and **Achievable Throughput** on the $y$-axis.
 
-![image Roofline model](/assets/images/2025-11-10-gemm/intro_roofline.png)
+![image Roofline model](/assets/images/2025-12-22-gemm/intro_roofline.png)
 <p style="text-align: center;"><i>The roofline model.</i></p>
 
 **Operational Intensity** measures the number of floating-point operations performed per byte of memory transferred (FLOPs/Bytes).
@@ -77,7 +79,7 @@ The Roofline Model visualizes two types of "roofs" in a 2D plot:
 
 1. **Memory bandwidth roof**, represents the (theoretical) peak memory bandwidth. As noted in the sum reduction post, the RTX 5070 Ti has a peak memory bandwidth of approximately 896 GB/s. This roof appears as a slanted line on the plot, following the equation $Performance = Memory\,Bandwidth \times Operational \, Intensity$.
 
-2. **Compute roof**, represents the theoretical peak throughput of the hardware. Based on the [specification document](https://images.nvidia.com/aem-dam/Solutions/geforce/blackwell/nvidia-rtx-blackwell-gpu-architecture.pdf), RTX5070Ti achieves a peak FP32 throughput of 43.9TFLOPs/s for standard operations and 87.9TFLOPs/s for tensor operations.
+2. **Compute roof**, represents the theoretical peak throughput of the hardware. According to the [official specification document](https://images.nvidia.com/aem-dam/Solutions/geforce/blackwell/nvidia-rtx-blackwell-gpu-architecture.pdf), RTX5070Ti achieves a peak FP32 throughput of 43.9 TFLOPs/s for standard floating-point operations, and a peak mixed-precision Tensor Core throughput of 87.9 TFLOPs/s.
 
 Regions below the memory bandwidth roof are considered **memory-bound**, while regions below the compute roof are considered **compute-bound**.
 
@@ -204,8 +206,7 @@ In this post, we will look into the following implementations:
 <div class="div-warning">
 <h4>🚨 CAUTION 🚨</h4>
 
-Before invoking any kernel, we make sure that $M$ and $N$ are both divisible by the block size, so we don't do any boundary check. In practice, however, 
-<b>boundary check is necessary to prevent incorrect or undefined behavior</b>.
+Not all kernels include boundary checks as we ensure that $M$ and $N$ are divisible by the kernel-specific tiling parameters.  In practice, however, <b>boundary checks are necessary to prevent incorrect or undefined behavior</b>.
 </div>
 <!-- END OF DIV -->
 
@@ -213,7 +214,7 @@ Before invoking any kernel, we make sure that $M$ and $N$ are both divisible by 
 
 #### Kernel 01: Naive implementation
 
-![image Kernel 01: Naive](/assets/images/2025-11-10-gemm/kernel1.png)
+![image Kernel 01: Naive](/assets/images/2025-12-22-gemm/kernel1.png)
 <p style="text-align: center;"><i>Kernel 01.</i></p>
 
 In the naive implementation, each `BLOCK_DIM x BLOCK_DIM`-thread block is responsible for computing `BLOCK_DIM x BLOCK_DIM` submatrix of $C$. Within each block, every thread loads $K$ elements from $A$ and $K$ elements from $B$, then performs a dot product over these elements. The corresponding kernel code is shown below.
@@ -308,13 +309,18 @@ Additionally, I'd like to introduce the **three stages** of the implementation, 
 2. Dot-product computation
 3. epilogue + output stores
 
-Stage 1 and 2 are carried out within the block tile sliding through $K$, but otherwise, they are independent. For example, I can reuse the shared-memory stores from one kernel and the dot-product computation from another. Similarly, the epilogue stage is independent of the first two. You may also notice that many optimizations often modify some of the stages, not all.
+Stage 1 and 2 are carried out within the block tile sliding through $K$, but otherwise, they are independent. For example, I can reuse the shared-memory stores from one kernel and the dot-product computation from another as long as they both follow the same shared-memory layout. Similarly, the epilogue stage is independent of the first two. You may also notice that many optimizations often modify some of the stages, not all.
 
 For each `BLOCK_DIM x BLOCK_DIM` submatrix (tile) of $C$, the computation in Kernel 02 proceeds as follows.
 
 <!-- START OF DIV -->
 <div class="div-implementation">
-<i>// Each iteration slides the tile <b>to the right</b> in $A$ and <b>downward</b> in $B$ across the $K$ dimension.</i>
+
+// Each block allocates two <code>BLOCK_DIM x BLOCK_DIM</code> shared memory buffers: <br />
+// one for elements of $A$ (<code>As</code>) and another for elements of $B$ (<code>Bs</code>).
+<br /><br />
+
+// Each iteration slides the tile <b>to the right</b> in $A$ and <b>downward</b> in $B$ across the $K$ dimension.
 <br />
 <i>for k_offset = 0; k_offset < K; k_offset += BLOCK_DIM {</i>
 <br /><br />
@@ -322,12 +328,9 @@ For each `BLOCK_DIM x BLOCK_DIM` submatrix (tile) of $C$, the computation in Ker
 <b>Stage 1: shared-memory stores</b>
 <br /><br />
 <li>
-Each block allocates two `BLOCK_DIM x BLOCK_DIM` shared memory buffers: one for elements of $A$ (`A_shared`) and another for elements of $B$ (`B_shared`).
+All threads collaboratively store a <code>BLOCK_DIM x BLOCK_DIM</code> tile of $A$ into <code>As</code> corresponding to the same rows as $C$ and columns with range <code>[k_offset, k_offset + BLOCK_DIM)</code>.
 </li>
-<li>
-All threads collaboratively store a <code>BLOCK_DIM x BLOCK_DIM</code> tile of $A$ into <code>A_shared</code> corresponding to the same rows as $C$ and columns with range <code>[k_offset, k_offset + BLOCK_DIM)</code>.
-</li>
-<li>All threads collaboratively store a <code>BLOCK_DIM x BLOCK_DIM</code> tile of $B$ into <code>B_shared</code> corresponding to the same columns as $C$ and rows with range <code>[k_offset, k_offset + BLOCK_DIM)</code>.
+<li>All threads collaboratively store a <code>BLOCK_DIM x BLOCK_DIM</code> tile of $B$ into <code>Bs</code> corresponding to the same columns as $C$ and rows with range <code>[k_offset, k_offset + BLOCK_DIM)</code>.
 </li>
 
 <br />
@@ -347,7 +350,7 @@ Each thread computes and accumulates the partial dot product into the <code>sum<
 <br /><br />
 <b>Stage 3: epilogue + output stores</b>
 <br /><br />
-<ol start="6">
+<ol start="5">
 <li>
 Each thread computes $\alpha \times sum + \beta \times c_{value}$ and stores the result back to $C$.
 </li>
@@ -357,7 +360,7 @@ Each thread computes $\alpha \times sum + \beta \times c_{value}$ and stores the
 
 The overall implementation can be illustrated below.
 
-![image Kernel 02: Block tiling](/assets/images/2025-11-10-gemm/kernel2.png)
+![image Kernel 02: Block tiling](/assets/images/2025-12-22-gemm/kernel2.png)
 <p style="text-align: center;"><i>Kernel 02.</i></p>
 
 And the kernel code is as follows.
@@ -412,12 +415,12 @@ __global__ void __launch_bounds__(BLOCK_DIM * BLOCK_DIM) block_tiling_gemm(
 <!-- START OF DIV -->
 <div class="div-author-note">
 <h4>Author's Note</h4>
-I found the notion of shifting the pointers difficult to understand at first, so I would initially add the offsets within iterations, e.g.,
+I found the notion of shifting the pointers difficult to understand at first, so I initially added the offsets within iterations, e.g.,
 <br /><br />
 <pre><code>uint const global_idx{(block_row_offset + threadIdx.y) * N + (block_col_offset + threadIdx.x)};
 C[global_idx] = alpha * sum + beta * C[global_idx];
 </code></pre>
-Once I grasped it, while shifting the pointers does simplify the code, I found that adding offsets within iterations can sometimes yield higher throughput (particularly in the half-precision GEMM Kernel 12).
+Once I grasped it, while shifting the pointers does simplify the code, I found that adding offsets within loop iterations can sometimes yield noticeably higher throughput.
 </div>
 <!-- END OF DIV -->
 
@@ -474,10 +477,12 @@ This kernel corresponds to Kernel 5 in [Simon's blog post](https://siboehm.com/a
 
 The kernel implementation is illustrated below.
 
-![image Kernel 01: Naive](/assets/images/2025-11-10-gemm/kernel3.png)
+![image Kernel 01: Naive](/assets/images/2025-12-22-gemm/kernel3.png)
 <p style="text-align: center;"><i>Kernel 03.</i></p>
 
-This is where I had to remind myself many times that **stage 1 (shared-memory stores) and stage 2 (dot-product computation) are independent of each other** (it's probably because each shared-memory buffer was the same size as the block in the previous kernel). **This kernel primarily modifies stage 2 and 3 given the `TM x TN` tile to process**. The only change to stage 1 results from transforming the thread block into one dimension; since the coordinates used in stage 1 and stage 2 (even the thread coordinates for $A$ vs $B$ in stage 2) are now different, it's easier to work with one-dimensional thread block and generate the coordinates accordingly.
+This is where I had to remind myself repeatedly that **stage 1 (shared-memory stores) and stage 2 (dot-product computation) are independent of each other** (my confusion probably stemmed from reusing the same parameter `BLOCK_DIM` for both the shared-memory stores and the tile size in the previous kernel).
+
+**This kernel primarily modifies stage 2 and 3 given the `TM x TN` tile to process**. The only change to stage 1 results from transforming the thread block into one dimension; since the coordinates used in stage 1 and stage 2 (even the thread coordinates for $A$ vs $B$ in stage 2) are now different, it's easier to work with one-dimensional thread block and generate the coordinates accordingly.
 
 In other words, instead of defining a 2D block shape like this:
 
@@ -493,7 +498,7 @@ dim3 block_dim((BM * BN) / (TM * TN));
 
 This simplifies the indexing logic while still covering the same number of threads.
 
-My kernel implementation is as follows.
+The kernel implementation is as follows.
 
 ```c++
 template <uint const NUM_THREADS, uint const BM, uint const BN, uint const BK, uint const TM, uint const TN>
@@ -556,7 +561,7 @@ __global__ void __launch_bounds__(NUM_THREADS) thread_coarsening_2d_gemm(
         __syncthreads();
     }
 
-    // Stage 3: output stores.
+    // Stage 3: epilogue + output stores.
     for (int tile_y_idx{0}; tile_y_idx < TM; ++tile_y_idx) {
         for (int tile_x_idx{0}; tile_x_idx < TN; ++tile_x_idx) {
             uint C_idx{};
@@ -584,7 +589,9 @@ In many cases, the shared-memory tiles are larger than the number of threads in 
 
 In practice, however, we'll need proper boundary checks to handle cases where these conditions don't hold.
 
-![image Shared-memory stores in Kernel 03](/assets/images/2025-11-10-gemm/kernel3_sm_store.png)
+The figure below illustrates an example of how `stride_A` and `stride_B` are used in loading into shared memory.
+
+![image Shared-memory stores in Kernel 03](/assets/images/2025-12-22-gemm/kernel3_sm_store.png)
 <p style="text-align: center;"><i>An example of shared-memory stores in Kernel 03.</i></p>
 
 This kernel achieves the following performance, marking a significant jump compared to the previous implementation.
@@ -604,7 +611,7 @@ Global memory access is relatively slow, so it's generally recommended to **comb
 
 Up to now, all global memory loads have been performed using 32-bit transactions. In Kernel 3, for example, if we inspect the line where elements from `A` are loaded in [Godbolt](https://godbolt.org/z/a4sc1Wfb1), we see the PTX instruction: `ld.global.f32`. The goal of the optimization in this kernel is to **reduce the number of global memory transfers** by merging them into **128-bit transactions**, which improves memory throughput. To do that, we use the built-in vector type `float4`, which packs four consecutive `float` elements into a single 16-byte vector.
 
-Additionally, we introduce another level of caching using registers in Stage 2 (dot-product computation). We discussed earlier that shared memory has higher bandwidth compared to global memory. Register access is even faster than shared memory, so since we are reusing elements in shared memory during the `TM x TN` tile computation, we can store the elements of each column from As and each row from Bs in registers. This technique also helps understanding how matrices are loaded into fragments when using tensor cores later.
+Additionally, we introduce another level of caching using registers in Stage 2 (dot-product computation). We discussed earlier that shared memory has higher bandwidth compared to global memory. Register access is even faster than shared memory, so since we are reusing elements in shared memory during the `TM x TN` tile computation, we can store the elements of each column from As and each row from Bs in registers. This technique also helps understanding how matrices are loaded into fragments when using Tensor Cores later.
 
 The code update is as follows.
 
@@ -703,7 +710,7 @@ I refer to the non-subdivided warp tiling (i.e., my initial interpretation of wa
 
 Threads are always created, scheduled, and executed in groups of 32 called **warps**. When a multiprocessor receives one or more thread blocks to execute, it splits them into warps, and each warp is managed by the **warp scheduler**. In a warp tiling kernel, we restructure the work *within a warp* so that all threads cooperate to compute a tile of $C$, which can further boost performance.
 
-For example, when threads in a warp access contiguous memory addresses, global memory loads can be coalesced, and potential shared-memory bank conflicts become easier to detect and avoid (these conflicts occur when threads in a warp access the same shared memory bank but different addresses; see my [Sum Reduction post Kernel 1]({% link _posts/2025-10-27-reduction_sum_part2.markdown %}#kernel-1-interleaved-addressing-with-thread-divergence-resolved) for examples). Most importantly, the warp-level tile structure and load/compute pattern lays the foundation for using **tensor cores** in subsequent optimization steps.
+For example, when threads in a warp access contiguous memory addresses, global memory loads can be coalesced, and potential shared-memory bank conflicts become easier to detect and avoid (these conflicts occur when threads in a warp access the same shared memory bank but different addresses; see my [Sum Reduction post Kernel 1]({% link _posts/2025-10-27-reduction_sum_part2.markdown %}#kernel-1-interleaved-addressing-with-thread-divergence-resolved) for examples).
 
 In Kernel 5, we introduce the following terms:
 
@@ -717,7 +724,7 @@ One limitation is that each warp always consists of **32** threads (older GPUs m
 
 The following figure illustrates Kernel 05.
 
-![Kernel 05](/assets/images/2025-11-10-gemm/kernel5.png)
+![Kernel 05](/assets/images/2025-12-22-gemm/kernel5.png)
 <p style="text-align: center;"><i>Kernel 05.</i></p>
 
 <!-- START OF DIV -->
@@ -725,7 +732,7 @@ The following figure illustrates Kernel 05.
 <h4>Author's Note</h4>
 I agree with Simon that drawing the illustration helps with understanding the kernel implementation, especially when dealing with more complex methods. While the illustration above is more simplified, I would recommend incorporating $A$ and $B$ (or <code>As</code> and <code>Bs</code> in this case) at each level if things are still unclear, similar to how I illustrate Kernel 04 or how Simon illustrates each kernel.
 <br /><br />
-I ended up drawing the illustrations for Kernel 05 and Kernel 06 so many times on papers while trying to explain the implementation to myself out loud (though I also personally love to draw them; pretty diagrams make me happy ❤️).
+I ended up drawing the illustrations for Kernel 05 and Kernel 06 so many times on papers while trying to explain the implementation to myself out loud (though I also personally love to draw them; pretty diagrams make me happy 😊).
 </div>
 <!-- END OF DIV -->
 
@@ -774,12 +781,12 @@ We also introduce some new terms (the same terms used in Simon's):
 
 1. `WMITER`: The number of subwarps within a warp vertically.
 2. `WNITER`: The number of subwarps within a warp horizontally.
-3. `WSUBM`: The number of rows within a subwarp.
-4. `WSUBN`: The number of columns within a subwarp.
+3. `WSUBM`: The number of rows within a subwarp, derived from `WM / WMITER`.
+4. `WSUBN`: The number of columns within a subwarp, derived from `WN / WNITER`.
 
 The following figure illustrates the difference between Kernel 05 and Kernel 06.
 
-![Kernel 05 vs Kernel 06](/assets/images/2025-11-10-gemm/kernel6.png)
+![Kernel 05 vs Kernel 06](/assets/images/2025-12-22-gemm/kernel6.png)
 <p style="text-align: center;"><i>Kernel 05 vs Kernel 06.</i></p>
 
 Since each warp consists of 32 threads, the following requirement must apply.
@@ -788,7 +795,7 @@ $$
 \frac{WM \times WN}{WMITER \times TM \times WNITER \times TN} = 32
 $$
 
-Additionally, each thread now computes `WMITER * TM * WNITER * TN` output elements, compared to only `TM * TN` output elements in the previous kernel. Some tunings, especially on `TM` and `TN` might be necessary.
+Additionally, each thread now computes `WMITER * TM * WNITER * TN` output elements, compared to only `TM * TN` output elements in the previous kernel. Some parameter tunings, especially on `TM` and `TN` might be necessary.
 
 Stage 1 (shared-memory stores) remains the same as in the previous kernel. In stage 2 (dot-product computation) and stage 3 (epilogue + output stores), we simply place the subwarp loop on top of the existing thread-tiling loop:
 
@@ -813,6 +820,7 @@ for (int k{0}; k < BK; ++k) {
         }
     }
 
+    // out_values is now [WMITER * TM * WNITER * TN].
     for (int wmiter_idx{0}; wmiter_idx < WMITER; ++wmiter_idx)
         for (int wniter_idx{0}; wniter_idx < WNITER; ++wniter_idx)
             for (int tm_idx{0}; tm_idx < TM; ++tm_idx)
@@ -865,7 +873,7 @@ These modifications lead to a performance of 28.70 TFLOPs/s, which is more than 
 
 *How does Kernel 06 lead to such performance improvements?*
 
-If we look at my parameters setup, we'll see that each thread in both Kernel 05 and Kernel 06 compute the same amount of output elements . In particular, each thread computes 128 output elements in both configurations:
+If we look at my parameters setup, we'll see that each thread in both Kernel 05 and Kernel 06 compute the same amount of output elements. In particular, each thread computes 128 output elements in both configurations:
 
 | Kernel # | NUM_THREADS | WM | WN | TM | TN | WMITER | WNITER | 
 |:---|:---:|:---:|:---:|:---|:---:|:---:|:---:|
@@ -875,7 +883,7 @@ If we look at my parameters setup, we'll see that each thread in both Kernel 05 
 <!-- START OF DIV -->
 <div class="div-author-note">
 <h4>Author's Note</h4>
-As a precaution, I also ran Kernel 06 with the Kernel 05 configuration above, and it produced performance very similar to what's shown in the performance table.
+By comparing their configurations side-by-side, I'm suggesting that the Kernel 06 implementation can be reused for Kernel 05 by applying the configuration described above. As a precaution, I ran the Kernel 06 implementation with the Kernel 05 configuration, and it produced performance consistent with the results shown in the performance table.
 </div>
 <!-- END OF DIV -->
 
@@ -883,7 +891,7 @@ It's fascinating to observe that the throughput of Kernel 06 is approximately 10
 
 If we examine [the PTX instructions for each `K` iteration](https://godbolt.org/z/49PPss8hd) in the `compute_dot_products()` function (where I use Kernel 06 implementation code for both kernels but with different configurations), we can see that increasing both `WMITER` and `WNITER` from 1 to 2 changes the ordering of the PTX instructions:
 
-![PTX instructions: Kernel 05 vs Kernel 06](/assets/images/2025-11-10-gemm/kernel6_ptx.png)
+![PTX instructions: Kernel 05 vs Kernel 06](/assets/images/2025-12-22-gemm/kernel6_ptx.png)
 <p style="text-align: center;"><i>PTX instructions: Kernel 05 vs Kernel 06.</i></p>
 
 The `fma` (fused multiply-add) instruction can only execute once *the data it depends on is already available* in registers. In Kernel 05, all eight column values of `Bs` must be loaded into `reg_N` (since `TN = 8` in the Kernel 05 configuration) before the `fma` instructions for subsequent rows can be issued. This creates large `fma` blocks, each containing eight `fma` instructions. These long dependency chains introduce longer stalls, which reduce instruction-level parallelism (ILP) and ultimately lower IPC.
@@ -892,10 +900,10 @@ On the other hand, in Kernel 06, the `fma` instructions for subsequent rows only
 
 Another way to illustrate the PTX instruction ordering is shown in the diagram below.
 
-![PTX instructions diagram: Kernel 05 vs Kernel 06](/assets/images/2025-11-10-gemm/kernel6_ptx_diagram.png)
+![PTX instructions diagram: Kernel 05 vs Kernel 06](/assets/images/2025-12-22-gemm/kernel6_ptx_diagram.png)
 <p style="text-align: center;"><i>PTX instruction diagram: Kernel 05 vs Kernel 06.</i></p>
 
-Out of curiosity, I experimented with different `TM`, `TN`, `WMITER`, and `WNITER` configurations while keeping the total number of elements computed per thread the same (i.e., 128 elements). The stage 3 (epilogue + output stores) configuration was kept the same  throughout these experiments. I did, however, have to disable the matrix verification step temporarily since the differing configurations would otherwise produce incorrect outputs.
+Out of curiosity, I experimented with different `TM`, `TN`, `WMITER`, and `WNITER` configurations while keeping the total number of elements computed per thread the same (i.e., 128 elements). The stage 3 (epilogue + output stores) configuration was kept the same  throughout these experiments, which required disabling the matrix verification step temporarily since the different configurations would produce incorrect outputs. Note that `TN` should always be divisible by 4.
 
 | TM | TN | WMITER | WNITER | TFLOPs/s | Remark |
 |:---|:---:|:---:|:---:|:---|:---:|
@@ -983,7 +991,7 @@ Overall, transposing `As` leads to a noticeable improvement compared to Kernel 0
 <!-- START OF DIV -->
 <div class="div-author-note">
 <h4>Author's Note</h4>
-I did experiment with only vectorizing <code>Bs</code> loads in Kernel 06; it did not lead to any significant performance improvement.
+I did experiment with only vectorizing <code>Bs</code> loads in Kernel 06. Interestingly, it did not lead to any significant performance improvement.
 </div>
 <!-- END OF DIV -->
 
@@ -1001,7 +1009,7 @@ Now that `As` is transposed, instead of storing into consecutive indices horizon
 
 **`As` loads**
 
-![How elements in As are initially loaded](/assets/images/2025-11-10-gemm/kernel7.png)
+![How elements in As are initially loaded](/assets/images/2025-12-22-gemm/kernel7.png)
 <p style="text-align: center;"><i>The <b>first</b> elements loaded from non-transposed <code>As</code> by all threads in a warp during the <code>k</code>th, <code>WMITER = 0</code>, <code>WNITER = 0</code> iteration.</i></p>
 
 In each iteration over `K`, `WMITER`, and `WNITER`, all threads in a warp compute one element from each `TM * TN` block. As a result, the number of elements a warp needs to load from `As` equals the number of `TM * TN` blocks stacked vertically. In my configuration where `WM = 32`, `WMITER = 2`, `TM = 8`, this results in 2-way bank conflicts.
@@ -1026,7 +1034,7 @@ So far, we have been using **synchronous** data copies when loading elements fro
 
 Introduced as part of Asynchronous Data Copies in CUDA 11.0, `__pipeline_memcpy_async` is a `memcpy_async` primitive that allows data to be copied from global memory to shared memory **without passing through registers**. Depending on the transfer size, it can even bypass the L1 cache. By avoiding the register path, fewers registers are required, which can in turn improve occupancy.
 
-![Global to shared memory copies](/assets/images/2025-11-10-gemm/kernel8_intro.png)
+![Global to shared memory copies](/assets/images/2025-12-22-gemm/kernel8_intro.png)
 <p style="text-align: center;"><i>Synchronous vs asynchronous data copies from global to shared memory.</i></p>
 
 To use asynchronous data copies, we simply replace the stage-1 (shared-memory store) code from **Kernel 06** with the code below. We don't use transposed `As` here since the current function does not appear to support transposed layouts.
@@ -1051,18 +1059,18 @@ for (int B_load_offset{0}; B_load_offset < BK; B_load_offset += stride_B) {
 __pipeline_commit();
 ```
 
-Although not shown here, using the code above might already yield some improvements. We will isolate and examine this improvement in the half-precision GEMM implementations Kernel 10.
+Although not shown here, using the code above might already yield some improvements. We will isolate and examine this improvement in Kernel 10.
 
 **Double buffering**
 
 For each sliding tile with length $BK$ across $K$, we currently perform shared-memory stores (stage 1) that is immediately followed by dot-product computation (stage 2) of *the particular tile* (see the illustration below).
 
-![The pipeline of the previous kernels](/assets/images/2025-11-10-gemm/kernel8_intro_prev.png)
-<p style="text-align: center;"><i>The pipeline of the previous kernels.</i></p>
+![Operation execution timeline of the previous kernels](/assets/images/2025-12-22-gemm/kernel8_intro_prev.png)
+<p style="text-align: center;"><i>Operation execution timeline of the previous kernels.</i></p>
 
 To further hide the data transfer latency, we can overlap the computation with data transfer illustrated as follows.
 
-![The new pipeline in Kernel 09](/assets/images/2025-11-10-gemm/kernel8_intro_now.png)
+![The new pipeline in Kernel 09](/assets/images/2025-12-22-gemm/kernel8_intro_now.png)
 <p style="text-align: center;"><i>The pipeline we aim to use in Kernel 09 to hide data transfer latency.</i></p>
 
 To enable this, we introduce an additional shared-memory buffer: one buffer holds the data currently used for computation, while the other preloads the next data tile, hence, the name **double buffering**.
@@ -1122,26 +1130,26 @@ The updated performance table can be found below.
 | kernel 07: transposing `As` | 29.71 | 93.84% |
 | kernel 08: asynchronous copy + double buffering 🆕 | 30.28 | 95.64% |
 
-We have now reached approximately 96% of cuBLAS performance on single-precision GEMM!
+We have now reached beyond 95% of cuBLAS performance on single-precision GEMM!
 
 <hr class="hr-top" /><hr />
 
-# 5. Tensor cores
+# 5. Tensor Cores
 
 Multiply-add is the most frequently used operation in modern neural networks as it is the building block of fully-connected and convolutional layers (read [here](https://docs.nvidia.com/cutlass/latest/media/docs/cpp/implicit_gemm_convolution.html) if you're curious about how convolutional layers can be mapped into implicit GEMM). As modern neural networks continue to grow in size and demand significantly higher computational capability, the ability to accelerate multiply-add operations becomes crucial.
 
-To address this need, [the Volta GPU architecture introduced tensor cores](https://images.nvidia.com/content/volta-architecture/pdf/volta-architecture-whitepaper.pdf), a specialized component of the GPU architecture designed to accelerate *matrix* multiply-accumulate operations. Tensor cores provide significantly higher throughput than CUDA cores. For example, on my RTX 5070 Ti, the peak *BF16 throughput with FP32 accumulation* reaches 87.9 TFLOPs/s, compared to only 43.9 TFLOPs/s of peak non-tensor core throughput.
+To address this need, [the Volta GPU architecture introduced Tensor Cores](https://images.nvidia.com/content/volta-architecture/pdf/volta-architecture-whitepaper.pdf), a specialized component of the GPU architecture designed to accelerate *matrix* multiply-accumulate operations. Tensor Cores provide significantly higher throughput than CUDA cores. For example, on my RTX 5070 Ti, the peak *BF16 throughput with FP32 accumulation* reaches 87.9 TFLOPs/s, compared to only 43.9 TFLOPs/s of peak non-tensor core FP32 throughput.
 
-There are two ways to use tensor cores: via wmma or mma instructions. Both instruction types include load, store, and computation operations, which are performed collectively by all threads in a warp.
+There are two ways to use Tensor Cores: via wmma or mma instructions. Both instruction types include load, store, and computation operations, which are performed collectively by all threads in a warp.
 
-wmma instructions can be used through a high-level API or via explicit PTX instructions. Overall, wmma is more straightforward to use, but also more rigid, as it does not allow modification of how matrix elements are distributed across threads. mma, on the other hand, can only be used via PTX instructions and requires a deeper level of understanding of how it works, but offers greater flexibility. For example, custom swizzling can be used with mma but not with wmma (to my current knowledge).
+wmma instructions can be used through a high-level API or via explicit PTX instructions. Overall, wmma is more straightforward to use, but also more rigid. mma, on the other hand, can only be used via PTX instructions and requires a deeper level of understanding of how it works, but offers greater flexibility. For example, custom swizzling can be used with mma but not with wmma (to my current knowledge; we'll see a swizzle example with mma in Kernel 14).
 
 <!-- START OF DIV -->
 <div class="div-author-note">
 <h4>Author's Note</h4>
 Notice two specific details in the explanation above: (1) the emphasis on <i>matrix</i> in matrix multiply-accumulate and (2) the particular example of <i>BF16 throughput with FP32 accumulation</i>.
 <br /><br />
-We will examine these points in more details later, but essentially, tensor cores operate on matrices with predetermined sizes and data types for each matrix, depending on the instruction being used (wmma or mma).
+We will examine these points in more details later, but essentially, Tensor Cores operate on matrices with predetermined sizes and data types for each matrix, depending on the instruction being used (wmma or mma).
 </div>
 <!-- END OF DIV -->
 
@@ -1149,7 +1157,7 @@ We will examine these points in more details later, but essentially, tensor core
 
 # 6. Half-precision GEMM implementations
 
-Tensor cores do not currently support all data types. The available combinations of data types for the multiplicand and accumulator matrices are listed in [this table](https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-data-types). For instance, 
+Tensor Cores do not currently support all data types. The available combinations of data types for the multiplicand and accumulator matrices are listed in [this table](https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-data-types). For instance, 
 among floating-point data types, there is currently no support for using FP32 for both the multiplicands and the accumulator. Because of that, we will focus on half-precision GEMM implementations in the rest of the post.
 
 In particular, we will use the 16-bit alternative floating-point data type BFloat16 (`.bf16`) for the multiplicands $A$ and $B$, and the 32-bit IEEE floating-point data type (`.f32`) for the accumulator $C$.
@@ -1161,17 +1169,17 @@ BFloat16 stands for <i>Brain Floating Point Format</i>. It is a custom 16-bit fl
 <br />
 
 <div style="background-color: white; padding-top: 20px; margin-top: 20px;">
-    <img src="/assets/images/2025-11-10-gemm/hgmm_bfloat16.png" alt="The floating-point formats.">
+    <img src="/assets/images/2025-12-22-gemm/hgmm_bfloat16.png" alt="The floating-point formats.">
 </div>
 <p style="text-align: center;"><i>The three floating-point formats; figure taken from <a href="https://cloud.google.com/blog/products/ai-machine-learning/bfloat16-the-secret-to-high-performance-on-cloud-tpus">the Google Cloud's BFloat16 blog</a>.</i></p>
 
-As shown in the figure above, BFloat16 has the same dynamic range as FP32 due to having the same number of exponent bits. This allows simpler to and from FP32 compared to FP16 and provides greater robustness against numerical instability during training. Given its 16-bit size, BFloat16 reduces memory usage and can lead to overall faster performance, making it advantageous for layers that do not require a high level of precision. You can read more about the BFloat16 format <a href="https://cloud.google.com/blog/products/ai-machine-learning/bfloat16-the-secret-to-high-performance-on-cloud-tpus">here</a>.
+As shown in the figure above, BFloat16 has the same dynamic range as FP32 due to having the same number of exponent bits. This allows simpler conversions to and from FP32 compared to FP16 and provides greater robustness against numerical instability during training. Given its 16-bit size, BFloat16 reduces memory usage and can lead to overall faster performance, making it advantageous for layers that do not require a high level of precision. You can read more about the BFloat16 format <a href="https://cloud.google.com/blog/products/ai-machine-learning/bfloat16-the-secret-to-high-performance-on-cloud-tpus">here</a>.
 </div>
 <!-- END OF DIV -->
 
-To implement HGEMM, I begin by enabling half-precision computation in *some* of the SGEMM kernels implemented above and examine their performance relative to SGEMM. I then explore the use of tensor cores via the wmma API and optimize the implementation from there. Each kernel implementation is compared against cuBLAS performance.
+To implement HGEMM, I begin by enabling half-precision computation in *some* of the SGEMM kernels implemented above and examine their performance relative to SGEMM. I then explore the use of Tensor Cores via the wmma APIs and mma instructions, and optimize the implementation from there. Each kernel implementation is compared against the updated cuBLAS performance on HGEMM.
 
-The performance of some of the kernels above on half-precision GEMM is as follows.
+The performance of some of the kernels already discussed on half-precision GEMM is as follows.
 
 | Kernel # | SGEMM Performance (TFLOPs/s) | HGEMM Performance (TFLOPs/s) | % HGEMM cuBLAS performance |
 |:---|:---:|:---:|:---:|
@@ -1182,24 +1190,25 @@ The performance of some of the kernels above on half-precision GEMM is as follow
 | kernel 05: warp tiling | 26.19 | 26.81 | 30.19% |
 | kernel 06: warp tiling, subdivided | 28.70 | 27.23 | 30.66% |
 
-While cuBLAS performance shoots up to 88.81 TFLOPs/s for HGEMM, kernels up to Kernel 06 show performance similar to SGEMM, so I stopped there and shifted focus to tensor cores. I also did not look into why the performance of Kernel 02 dropped in HGEMM - something to look into in the future.
+While cuBLAS performance shoots up to 88.81 TFLOPs/s for HGEMM, kernels up to Kernel 06 show performance similar to SGEMM, so I stopped there and shifted focus to Tensor Cores. I also did not look into why the performance of Kernel 02 dropped in HGEMM - perhaps something to look into in the future.
 
-The kernels using tensor cores are as follows.
+The kernels using Tensor Cores are as follows.
 
-1. [**Kernel 09: Tensor cores (wmma API)**](#kernel-09-tensor-cores-wmma-api)
-2. [**Kernel 10 & 11: Tensor cores + asynchronous gmem loads + double buffering**](#kernel-10--11-tensor-cores--asynchronous-gmem-loads--double-buffering)
-4. [**Kernel 12: Tensor cores + three-level pipeline**](#kernel-12-tensor-cores--three-level-pipeline)
-5. [**Kernel 13: Tensor cores (mma instructions)**](#kernel-13-tensor-cores-mma-instructions)
+1. [**Kernel 09: Tensor Cores (wmma API)**](#kernel-09-tensor-cores-wmma-api)
+2. [**Kernel 10 & 11: Tensor Cores + asynchronous gmem loads + double buffering**](#kernel-10--11-tensor-cores--asynchronous-gmem-loads--double-buffering)
+4. [**Kernel 12: Tensor Cores + three-level pipeline**](#kernel-12-tensor-cores--three-level-pipeline)
+5. [**Kernel 13: Tensor Cores (mma instructions)**](#kernel-13-tensor-cores-mma-instructions)
 6. [**Kernel 14 & 15: Swizzled shared memory + three-level pipeline**](#kernel-14--15-swizzled-shared-memory--three-level-pipeline)
 
+<hr />
 
-#### Kernel 09: Tensor cores (wmma API)
+#### Kernel 09: Tensor Cores (wmma API)
 
-I use the [warp matrix functions](https://docs.nvidia.com/cuda/archive/12.2.2/cuda-c-programming-guide/index.html#warp-matrix-functions) defined in the namespace `nvcuda::wmma`; I would highly recommend reading the documentation first before continuing reading this post.
+I use the [warp matrix functions](https://docs.nvidia.com/cuda/archive/12.2.2/cuda-c-programming-guide/index.html#warp-matrix-functions) defined in the namespace `nvcuda::wmma` in this kernel; I would highly recommend reading the documentation first before continuing reading this post.
 
-To understand how tensor cores and the wmma APIs can be used, it helps to visualize and compare the new kernel to Kernel 06 (warptiling, subdivided):
+To understand how Tensor Cores and the wmma APIs can be used, it helps to visualize and compare the new kernel to Kernel 06 (warptiling, subdivided):
 
-![Kernel 06 vs Kernel 09](/assets/images/2025-11-10-gemm/kernel9.png)
+![Kernel 06 vs Kernel 09](/assets/images/2025-12-22-gemm/kernel9.png)
 <p style="text-align: center;"><i>The comparison between Kernel 06 and Kernel 09.</i></p>
 
 There are three main differences between Kernel 06 and Kernel 09 as illustrated above:
@@ -1212,7 +1221,7 @@ There are three main differences between Kernel 06 and Kernel 09 as illustrated 
     In other words, rather than deciding the number of subwarp tiles and deriving the subwarp size, we now choose the subwarp size directly, and the number of subwarp tiles follows.
 3. Kernel 09 introduces `WMMA_K`, which determines the number of tiles along the $BK$ dimension.
 
-`WMMA_M`, `WMMA_N`, and `WMMA_K` indicate the matrix size; the variety of matrix sizes supported by tensor cores are predetermined and can be found [here](https://docs.nvidia.com/cuda/archive/12.2.2/cuda-c-programming-guide/index.html#element-types-and-matrix-sizes). In the case of using wmma and the BFloat16 data type, the supported matrix sizes are 16x16x16, 32x8x16, and 8x32x16 in the format of `mxnxk`.
+`WMMA_M`, `WMMA_N`, and `WMMA_K` indicate the matrix size; the variety of matrix sizes supported by Tensor Cores are predetermined and can be found [here](https://docs.nvidia.com/cuda/archive/12.2.2/cuda-c-programming-guide/index.html#element-types-and-matrix-sizes). In the case of using wmma and the BFloat16 data type, the supported matrix sizes are 16x16x16, 32x8x16, and 8x32x16 in the format of `mxnxk`.
 
 <!-- START OF DIV -->
 <div class="div-author-note">
@@ -1238,7 +1247,7 @@ for (int wmma_row_idx{0}; wmma_row_idx < NUM_WMMA_M; ++wmma_row_idx)
         nvcuda::wmma::fill_fragment(acc_frags[wmma_row_idx][wmma_col_idx], 0.0f);
 ```
 
-Tensor cores mainly handle stage 2 (dot-product computation) and 3 (epilogue + output stores), so there are no changes to stage 1 (shared-memory stores). In this case, I reuse `load_gmem_to_smem` function from Kernel 04 (vectorized memory access).
+The usage of Tensor Cores here mainly deals with stage 2 (dot-product computation) and 3 (epilogue + output stores), so there are no changes to stage 1 (shared-memory stores). In this case, I reuse `load_gmem_to_smem` function from Kernel 04 (vectorized memory access).
 
 Stage 2 (dot-product computation) implementation is as follows.
 
@@ -1304,16 +1313,16 @@ for (int wmma_row_idx{0}; wmma_row_idx < NUM_WMMA_M; ++wmma_row_idx) {
 }
 ```
 
-Notice that the current wmma APIs do not incorporate $\alpha$ and $\beta$, so these must be handled manually. We also **cannot simply assume that the fragments are stored in a particular order**. For now, the only guarantee is that elements can be mapped safely between accumulator fragments. In other words, elements with the same index in different accumulator fragments correspond to the same position in the original matrix, regardless of where that index is stored internally.
+Notice that the current wmma APIs do not incorporate $\alpha$ and $\beta$, so these must be handled manually. We also **cannot simply assume that all fragments are stored in a particular order**. For now, the only guarantee is that elements can be mapped safely between fragments of the same type. For example, elements with the same index in different accumulator fragments correspond to the same position in the original matrix, regardless of where that index is stored internally.
 
 <!-- START OF DIV -->
 <div class="div-interested">
 <h4>If You're Curious...</h4>
-Unlike <code>wmma</code>, <code>mma</code> requires users to explicitly define how the matrix elements are discributed across threads, so the documentation also specifies the layout of each fragment. <a href="https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-fragment-mma-16816-float">Here </a> is an example where we can see the layouts of the multiplicand $A$ fragment, the multiplicand $B$ fragment, and the accumulator fragments in the 16x8x16 matrix for <i>each floating-point data types</i>.
+Unlike <code>wmma</code>, using <code>mma</code> requires understanding the layout of each fragment. <a href="https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-fragment-mma-16816-float">Here </a> is an example where we can see the layouts of the multiplicand $A$ fragment, the multiplicand $B$ fragment, and the accumulator fragments in the <code>m16n8k16</code> matrix for <i>each floating-point data types</i>.
 </div>
 <!-- END OF DIV -->
 
-The performance of the kernel can be found in the table below. As we can see, utilizing tensor cores significantly improves the throughput to around 70% of cuBLAS performance!
+The performance of the kernel can be found in the table below. As we can see, utilizing Tensor Cores significantly improves the throughput to around 70% of cuBLAS performance!
 
 | Kernel # | Performance (TFLOPs/s) | % cuBLAS performance |
 |:---|:---:|:---:|:---:|
@@ -1327,13 +1336,13 @@ The performance of the kernel can be found in the table below. As we can see, ut
 <h4>Author's Note</h4>
 If you're still unclear about what fragments are and what they mean for each thread, don't worry! I struggled to understand this as well at the beginning; I only managed to grasp the concept after attempting to use the <code>mma</code> instructions.
 <br /><br />
-We can treat fragments as registers that hold multiple elements. In the <a href="https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-fragment-mma-16816-float">16x8x16 matrix</a>, for instance, 16x16 elements are collectively loaded from <code>As</code> to <code>a_frag</code> by a warp. This means that each thread handles $16 \times 16 / 32 = 8$ elements. So <code>a_frag</code> in each thread contains eight elements, and wmma determines which specific elements each thread is responsible for. Similarly, both <code>b_frag</code> and <code>acc_frag</code> hold four elements each in each thread. 
+We can treat fragments as registers that hold multiple elements. In the <a href="https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-fragment-mma-16816-float">m16n8k16 matrix</a>, for instance, 16x16 elements are collectively loaded from <code>As</code> to <code>a_frag</code> by a warp. This means that each thread handles $16 \times 16 / 32 = 8$ elements. So <code>a_frag</code> in each thread contains eight elements, and wmma determines which specific elements each thread is responsible for. Similarly, both <code>b_frag</code> and <code>acc_frag</code> hold four elements each in each thread. 
 </div>
 <!-- END OF DIV -->
 
 <hr />
 
-#### Kernel 10 & 11: Tensor cores + asynchronous gmem loads + double buffering
+#### Kernel 10 & 11: Tensor Cores + asynchronous gmem loads + double buffering
 
 In both Kernel 10 and 11, we apply the two optimization techniques from Kernel 08 one by one, specifically:
 
@@ -1352,12 +1361,12 @@ These modifications result in the following performance improvements:
 
 <hr />
 
-#### Kernel 12: Tensor cores + three-level pipeline
+#### Kernel 12: Tensor Cores + three-level pipeline
 
 In Kernel 08, we define two levels for overlapping: shared-memory stores and dot-product computation. The dot-product computation itself, however, can be further divided into two steps: (1) register stores and (2) the actual dot-product computation. What if we try overlapping all these three steps, as illustrated below?
 
-![Kernel 12 pipeline.](/assets/images/2025-11-10-gemm/kernel12.png)
-<p style="text-align: center;"><i>Kernel 12.</i></p>
+![Kernel 12 pipeline.](/assets/images/2025-12-22-gemm/kernel12.png)
+<p style="text-align: center;"><i>Kernel 12 pipeline.</i></p>
 
 To do so, we first divide the dot-product computation into the following functions:
 
@@ -1408,49 +1417,49 @@ Since we can no longer directly compute the matrix multiplication, we now need $
 
 My first thought of how it overall should be implemented can be illustrated below.
 
-![First thought on the order of the operations in Kernel 12](/assets/images/2025-11-10-gemm/kernel12_order.png)
+![First thought on the order of the operations in Kernel 12](/assets/images/2025-12-22-gemm/kernel12_order.png)
 <p style="text-align: center;"><i>First thought on the order of the operations in Kernel 12.</i></p>
 
 With the implementation pseudocode below.
 
 ```c++
-load_gmem_to_smem(tile[0], A, B, As[0], Bs[0]);
+load_gmem_to_smem(tile[0], A, B, As[0], Bs[0]); // tile[0].
 
-load_gmem_to_smem(tile[1], A, B, As[1], Bs[1]);
+load_gmem_to_smem(tile[1], A, B, As[1], Bs[1]); // tile[1].
 
 load_smem_to_regs(As[0], Bs[0], A_frags[0], B_frags[0]); // tile[0].
 
 int current{0};
 
 for (tile_index = 2; tile_index < NUM_TILES; ++tile_index) {
-    load_gmem_to_smem(tile[tile_index], A, B, As[current], Bs[current]);
+    load_gmem_to_smem(tile[tile_index], A, B, As[current], Bs[current]); // tile[2] in 1st iter.
 
     load_smem_to_regs(As[current ^ 1], Bs[current ^ 1], A_frags[current ^ 1], B_frags[current ^ 1]); // tile[1] in 1st iter.
 
-    compute_dot_products(A_frags[current], B_frags[current], acc_frags); // tile [0] in 1st iter.
+    compute_dot_products(A_frags[current], B_frags[current], acc_frags); // tile[0] in 1st iter.
 
     current ^= 1;
 }
 
-load_smem_to_regs(As[current ^ 1], Bs[current ^ 1], A_frags[current ^ 1], B_frags[current ^ 1]);
+load_smem_to_regs(As[current ^ 1], Bs[current ^ 1], A_frags[current ^ 1], B_frags[current ^ 1]); // last tile.
 
-compute_dot_products(A_frags[current], B_frags[current], acc_frags);
+compute_dot_products(A_frags[current], B_frags[current], acc_frags); // second last tile.
 
-compute_dot_products(A_frags[current ^ 1], B_frags[current ^ 1], acc_frags);
+compute_dot_products(A_frags[current ^ 1], B_frags[current ^ 1], acc_frags); // last tile.
 
 // No change.
 run_epilogue(...);
 ```
 
-Recall that we already need to have $A$ and $B$ fragments for each WMMA tile. Given the implementation above, we also need two buffers for each multiplicand fragment, just like how we allocate two buffers for the shared memory. Because of this, we end up with significantly more registers per thread, which further reduces both the occupancy and the performance in my case.
+Recall that we now have $A$ and $B$ fragments for each WMMA tile. Given the implementation above, we would also need two buffers for each multiplicand fragment, just like how we allocate two buffers for the shared memory. Because of this, we end up with significantly more registers per thread, which further reduces both the occupancy and the performance in my case.
 
-Fortunately, we can actually **switch the order of the operations within the loop such that we no longer need the second buffer for the fragments**. The key observation is that it is not necessary to perform the register stores for the *next* computation **before** carrying out the dot-product computation for the *current* one! So within the `for` loop, we can actually do the following order:
+Fortunately, we can actually **switch the order of the operations within the loop such that we no longer need the second buffer for the fragments**. The key observation is that it is not necessary to perform the register stores for the *next* computation **before** carrying out the dot-product computation for the *current* one! So within the `for` loop, we can actually do the following ordering:
 
 ```c++
 for (tile_index = 2; tile_index < NUM_TILES; ++tile_index) {
-    load_gmem_to_smem(tile[tile_index], A, B, As[current], Bs[current]);
+    load_gmem_to_smem(tile[tile_index], A, B, As[current], Bs[current]); // tile[2] in 1st iter.
 
-    compute_dot_products(A_frags, B_frags, acc_frags); // tile [0] in 1st iter.
+    compute_dot_products(A_frags, B_frags, acc_frags); // tile[0] in 1st iter.
 
     // A_frags and B_frags are now free to use, so we can reuse it in the register stores!
     load_smem_to_regs(As[current ^ 1], Bs[current ^ 1], A_frags, B_frags); // tile[1] in 1st iter.
@@ -1462,11 +1471,11 @@ for (tile_index = 2; tile_index < NUM_TILES; ++tile_index) {
 Similarly, we run the dot-product computation first after the `for` loop ends.
 
 ```c++
-compute_dot_products(A_frags, B_frags, acc_frags);
+compute_dot_products(A_frags, B_frags, acc_frags); // second last tile.
 
-load_smem_to_regs(As[current ^ 1], Bs[current ^ 1], A_frags, B_frags);
+load_smem_to_regs(As[current ^ 1], Bs[current ^ 1], A_frags, B_frags); // last tile.
 
-compute_dot_products(A_frags, B_frags, acc_frags);
+compute_dot_products(A_frags, B_frags, acc_frags); // last tile.
 ```
 
 With these modifications, we're able to keep register usage sufficiently low and reach 98% of cuBLAS performance!
@@ -1486,15 +1495,15 @@ With these modifications, we're able to keep register usage sufficiently low and
 
 <hr />
 
-#### Kernel 13: Tensor cores (mma instructions)
+#### Kernel 13: Tensor Cores (mma instructions)
 
-So far, our kernels have mainly rlied on the wmma APIs. When loading the matrices into registers using these APIs (i.e., calling `load_matrix_sync()`), we can only provide the starting address, the stride in elements between consecutive rows or columns depending on the layout, and the memory layout of the matrix. The API then implicitly determines how the data is distributed across threads in the warp.
+So far, our kernels have mainly relied on the wmma APIs. When loading the matrices into registers using these APIs (i.e., calling `load_matrix_sync()`), we can only provide the starting address, the stride in elements between consecutive rows or columns depending on the layout, and the memory layout of the matrix. The API then implicitly determines how the data is distributed across threads in the warp.
 
-In some situations, however, we need more flexibility over how matrix elements are assigned to individual threads. Achieving this level of flexibility requires using the low-level MMA instructions directly.
+In some situations, however, we need greater flexibility in how individual threads interact with matrix fragments. Achieving this level of flexibility requires using the low-level MMA instructions directly.
 
 As mentioned earlier, working with mma instructions demands a much deeper understanding of their underlying mechanics. We will walk through the implementation step-by-step.
 
-Note that the matrix sizes supported by wmma and mma are different. mma supports only the `m16n8k16` and `m16n8k8` shapes. In this kernel, we'll use the `m16n8k16` matrix size.
+Note that the matrix sizes supported by wmma and mma are different. When using BFloat16 as multiplicands, mma supports only the `m16n8k16` and `m16n8k8` shapes. In the remaining kernels, we'll use the `m16n8k16` matrix size.
 
 <!-- START OF DIV -->
 <div class="div-interested">
@@ -1533,20 +1542,20 @@ To determine the correct value for the remaining parameters and arguments, we ne
 
 - **The values of `.shape`. and `.num` are based on the data type and the chosen matrix size**
 
-Since we are loading 16-bit data, we must use `.m8n8` matrix load as it is the only matrix load shape that supports 16-bit data types. Given the `.shape` parameter and the matrix size we choose then determine the `.num` parameter. In the case of choosing the `m16n8k16` matrix size, we load a `16x16` matrix from `As` into $A$ fragment registers, which is **four** `.m8n8` matrix loads. We then load a `16x8` matrix from `Bs` into $B$ fragment registers, which is **two** `.m8n8` matrix loads.
+Since we are loading 16-bit data, we must use `.m8n8` matrix load as it is the only matrix load shape that supports 16-bit data types. The `.shape` parameter and the matrix size we choose then determine the `.num` parameter. In the case of choosing the `m16n8k16` matrix size, we load a `16x16` matrix from `As` into $A$ fragment registers, which is **four** `.m8n8` matrix loads. We then load a `16x8` matrix from `Bs` into $B$ fragment registers, which is **two** `.m8n8` matrix loads. So `.num` when loading into $A$ and $B$ fragments are `.x4` and `.x2`, respectively.
 
 - **In some situations, not all threads are responsible for providing the values of `.p`**
 
-Depending on the value of `.num`, every group of eight threads provides eight addresses where each address corresponds to *the start of a matrix **row*** (see the following table; we'll look into what "matrix rows" mean in the next key point). This means that if `.num` is .`x2`, only the first 16 threads in a warp provide addresses 0 - 15. Based on my experience, it seems that the instruction would just ignore whatever addresses passed by the rest of the threads.
+Depending on the value of `.num`, every group of eight threads provides eight addresses where each address corresponds to *the start of a matrix **row*** (see the following table; we'll look into what "matrix rows" mean in the next key point). For example, if `.num` is .`x2`, only the first 16 threads in a warp provide addresses 0 - 15. Based on my experience, it seems that the instruction would just ignore whatever addresses passed by the rest of the threads.
 
-![The addresses provided by the corresponding groups of threads in ldmatrix.](/assets/images/2025-11-10-gemm/kernel13_ldmatrix.png)
-<p style="text-align: center;"><i>The addresses provided by the corresponding groups of threads in <code>ldmatrix</code>; table taken from <a href="https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-instructions-ldmatrix">PTX ISA</a></i></p>
+![The addresses provided by the corresponding groups of threads in ldmatrix.](/assets/images/2025-12-22-gemm/kernel13_ldmatrix.png)
+<p style="text-align: center;"><i>The addresses provided by the corresponding groups of threads in <code>ldmatrix</code>; table taken from <a href="https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-instructions-ldmatrix">PTX ISA documentation.</a></i></p>
 
-- **The shared memory addresses the participating threads need to supply are based on the layout of the fragments**
+- **The shared memory addresses `p` the participating threads need to supply are based on the layout of the fragments**
 
 How one or more `.m8n8` matrix loads are arranged relative to one another determines the address that each participating thread needs to provide. For example, the arrangement of four `.m8n8` matrix loads for `16x16` $A$ fragment and two `.m8n8` matrix loads for `16x8` $B$ fragment are illustrated below.
 
-![A fragment layout](/assets/images/2025-11-10-gemm/kernel13_start_addr.png)
+![A fragment layout](/assets/images/2025-12-22-gemm/kernel13_start_addr.png)
 <p style="text-align: center;"><i>$A$ fragment layout.</i></p>
 
 The starting address of each row in `As` can then be computed as follows.
@@ -1578,7 +1587,7 @@ Bs_mma_tile_row_offset = mma_k_offset;
 Bs_mma_tile_col_offset = warp_col_offset + mma_col_idx * MMA_N;
 
 Bs_fragment_row_idx = lane_idx % MMA_K;
-Bs_fragment_col_idx = 0;
+Bs_fragment_col_idx = 0; // Only one .8x8 matrix is loaded horizontally.
 
 Bs_starting_address_row_idx = Bs_mma_tile_row_offset + Bs_fragment_row_idx;
 Bs_starting_address_col_idx = Bs_mma_tile_col_offset + Bs_fragment_col_idx;
@@ -1587,9 +1596,9 @@ uint32_t shared_B_pointer = static_cast<uint32_t>(
     __cvta_generic_to_shared(&Bs[Bs_starting_address_row_idx * BN + Bs_starting_address_col_idx]));
 ```
 
-- **Each thread needs to allocate and provide destination registers `r`**
+- **All threads need to allocate and provide destination registers `r`**
 
-Unlike how we can use the `fragment` class in wmma, we need to create our own fragment registers when using mma directly. The number of elements each thread needs to store in the $A$ and $B$ fragment registers is listed in the [PTX documentation](https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-fragment-mma-16816-float).
+Unlike how we can use the `fragment` class in wmma, we need to create our own fragment registers when using mma directly. The number of elements each thread needs to store in the $A$ and $B$ fragment registers is listed in the [PTX ISA documentation](https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-fragment-mma-16816-float).
 
 According to the documentation for BFloat16-based `m16n8k16` matrix, the multiplicand $A$ fragment holds "four `.f16x2` registers, with each register containing two `.bf16` elements from the matrix $A$". An initial approach, therefore, would be to define the following registers:
 
@@ -1614,7 +1623,7 @@ We then can pass these registers as destination registers in the `ldmatrix` inst
 
 *Which registers hold which elements in the fragment matrix?* This is where the fragment layouts shown in the PTX ISA documentation come into place. Let's look at the `m16n8k16` matrix $A$ fragment layout.
 
-![A fragment layout](/assets/images/2025-11-10-gemm/kernel13_a_frag_layout.png)
+![A fragment layout](/assets/images/2025-12-22-gemm/kernel13_a_frag_layout.png)
 <p style="text-align: center;"><i>$A$ fragment layout for <code>m16n8k16</code> matrix size.</i></p>
 
 As we can see from the figure above, each thread holds eight `.bf16` elements, with every two `.bf16` elements packed into a single `.bf16x2` register. For instance, thread 0 stores the elements at coordinates `[[0, 0], [0, 1], [8, 0], [8, 1], [0, 8], [0, 9], [8, 8], [8, 9]]`.
@@ -1628,7 +1637,7 @@ We then repeat the same process for the $B$ fragment. The only additional detail
 
 Overall, we'll have the following instruction:
 
-![ldmatrix instruction](/assets/images/2025-11-10-gemm/kernel13_instruction.png)
+![ldmatrix instruction](/assets/images/2025-12-22-gemm/kernel13_instruction.png)
 <p style="text-align: center;"><i>The final ldmatrix instructions for m16n8k16 matrix size with BFloat16 data types.</i></p>
 
 **2\. Performing matrix multiplication**
@@ -1637,7 +1646,7 @@ We've now gotten passed the most complicated part (at least in my opinion, `ldma
 
 Performing matrix multiplication for our problem is pretty straightforward. We simply use `mma.sync` and pass along our registers:
 
-![mma.sync instruction](/assets/images/2025-11-10-gemm/kernel13_instruction_2.png)
+![mma.sync instruction](/assets/images/2025-12-22-gemm/kernel13_instruction_2.png)
 <p style="text-align: center;"><i>The mma.sync instruction for m16n8k16 matrix size with BFloat16 data types.</i></p>  
 
 And that's it!
@@ -1648,9 +1657,9 @@ As with the wmma APIs, we need to apply $\alpha$ and $\beta$ manually here as we
 
 Note that we can't use `ldmatrix` or `stmatrix` here since both instructions currently do not support 32-bit data transfer.
 
-We need pay close attention to the layout of elements within the accumulator fragment here.
+We need to pay close attention to the layout of elements within the accumulator fragment here.
 
-![Accumulator fragment layout](/assets/images/2025-11-10-gemm/kernel13_acc_frag_layout.png)
+![Accumulator fragment layout](/assets/images/2025-12-22-gemm/kernel13_acc_frag_layout.png)
 <p style="text-align: center;"><i>The accumulator fragment layout for <code>m16n8k16</code> matrix size.</i></p>
 
 Based on the layout shown above, each thread holds four `.f32` elements, with every two elements grouped and stored consecutively. To obtain the corresponding fragment row and column indices for each thread, we can compute them as shown in the following code. Since the elements are already paired, we can also vectorize the loads and stores using `float2`.
@@ -1697,7 +1706,7 @@ Unfortunately, we can't directly compare the performance with Kernel 09 given th
 <!-- START OF DIV -->
 <div class="div-author-note">
 <h4>Author's Note</h4>
-You can read the <a href="https://docs.nvidia.com/cuda/inline-ptx-assembly/index.html">Using Inline PTX Assembly in CUDA</a> documentation to become familiar with the syntax and related details.
+You can read the <a href="https://docs.nvidia.com/cuda/inline-ptx-assembly/index.html">Using Inline PTX Assembly in CUDA</a> documentation to become more familiar with the syntax and related details.
 </div>
 <!-- END OF DIV -->
 
@@ -1706,8 +1715,9 @@ You can read the <a href="https://docs.nvidia.com/cuda/inline-ptx-assembly/index
 #### Kernel 14 & 15: Swizzled shared memory + three-level pipeline
 
 We touched on shared memory bank conflicts briefly when implementing Kernel 07 (transposing `As`). As a reminder:
-- Shared memory is divided into 32 equally-sized banks, each bank can handle one 4-byte load or store operation per clock cycle. In our case, two BFloat16 elements share a single bank.
-- Bank conflicts happen when multiple threads in a warp access *different* addresses within the same bank in a single instruction.
+- Shared memory is divided into 32 equally-sized banks, each bank can handle one 4-byte load or store operation per clock cycle. In our case, two consecutive BFloat16 elements share a single bank.
+- Bank conflicts happen when multiple threads in a warp access *different* 32-bit locations within the same bank in a single instruction.
+    - The broadcast rule applies when multiple threads request for the *same 32-bit location in that bank*. In other words, if one thread requests the first 16 bits and another requests the next 16 bits within the 32-bit location in a bank, no bank conflict occurs ([source](https://forums.developer.nvidia.com/t/requesting-clarification-for-shared-memory-bank-conflicts-and-shared-memory-access/268574/2)).
 - An *n*-way bank conflict reduces throughput by a factor of *n*, so we want to minimize them whenever possible.
 - In some cases, it may not be possible to eliminate all bank conflicts; we will see examples of this in this section.
 
@@ -1716,14 +1726,13 @@ Bank conflicts often occur because the number of columns in shared memory is usu
 The swizzle method from CUTLASS has only three parameters:
 
 1. **`BBits`** --> the number of bits in the bit mask. The mask is created as `(1 << BBits) - 1`. For example, `BBits = 3` would produce a bit mask of `..00111`.
-2. **`MBase`** --> the number of least significant bits we want to keep constant. This is useful when a group of elements must stay together, i.e., the order of the elements within the group always remain the same.
-3. **`SShift`** --> the distance to shift the `YYY mask`, defined as `yyy_mask = bit_mask << (MBase + SShift)`. For simplicity, we only consider positive values of `SShift`.
+2. **`MBase`** --> the number of least significant bits we want to keep constant. This is useful when a group of elements must stay together and the order of the elements within the group always remain the same.
+3. **`SShift`** --> the distance to shift right the `YYY mask`. `YYY mask` is defined as `yyy_mask = bit_mask << (MBase + SShift)`. For simplicity, we only consider positive values of `SShift`.
 
 Given an offset (or an index to permute), we perform the following operation:
 
-```c++
-swizzed_offset = offset ^ ((offset & yyy_mask) >> SShift);
-```
+![Swizzle operation from CUTLASS](/assets/images/2025-12-22-gemm/kernel14_op.png)
+<p style="text-align: center;"><i>Swizzle operation from CUTLASS.</i></p>
 
 *How do we determine the values of the parameters?*
 
@@ -1751,22 +1760,22 @@ $$
 
 The number of 2-byte and 4-byte elements spanning all 32 shared-memory banks would be 64 and 32, respectively.
 
+Lei Mao provides a detailed explanation of the CUTLASS swizzle method [here](https://leimao.github.io/blog/CuTe-Swizzle/).
+
 **A toy example**
 
 Let's walk through a simple example: say we have a 32 x 32 matrix of `float` (4-byte) elements stored in shared memory. The figure below illustrates the bank indices the elements are mapped to.
 
-![Swizzle toy example: original bank indices](/assets/images/2025-11-10-gemm/kernel14_example_before.png)
+![Swizzle toy example: original bank indices](/assets/images/2025-12-22-gemm/kernel14_example_before.png)
 <p style="text-align: center;"><i>A toy example: the indices of the shared memory bank each element is mapped to.</i></p>
 
 In a toy kernel, suppose each warp accesses an entire row of the matrix: for warp 0, thread 0 accesses the element at $[0, 0]$, thread 1 accesses $[1, 0]$, and so on. Because all of these accesses map to the same shared-memory bank, this results in a 32-way bank conflict. To avoid this, we apply a swizzle to the matrix layout.
 
-In this case, there is no need to group elements together, so we set `MBase = 0`. Each row contains 32 elements that need to be permuted while keeping the row index unchanged. That means we only need to permute the 5 least significant bits of the column index (since $2^5 =32$), so we set `BBits = 5`.
-
-Finally, 32 elements span all 32 banks, so the value of `SShift` would be $log_{2}(32) - 0 = 5$.
+In this case, there is no need to group elements together, so we set `MBase = 0`. Each row contains 32 elements spanning all 32 banks that need to be permuted while keeping the row index unchanged. That means we only need to permute the 5 least significant bits of the column index (since $2^5 =32$), so we set `BBits = 5` and `SShift` $= log_{2}(32) - 0 = 5$.
 
 Using `Mbase = 0, BBits = 5, SShift = 5` parameters results in the following updated bank indices.
 
-![Swizzle toy example: updated bank indices](/assets/images/2025-11-10-gemm/kernel14_example_after.png)
+![Swizzle toy example: updated bank indices](/assets/images/2025-12-22-gemm/kernel14_example_after.png)
 <p style="text-align: center;"><i>A toy example: the <i>updated</i> indices of the shared memory bank each element is mapped to.</i></p>
 
 All elements in each row is now mapped to different banks, which eliminates bank conflicts.
@@ -1777,19 +1786,21 @@ For 2-byte elements, 64 elements span all 32 shared-memory banks. As part of the
 
 Accordingly, we set `MBase` $= log_{2}(8) = 3$, `BBits` $=log_{2}(8) = 3$, and `SShift` $= log_{2}(64) - $ `Mbase` $= 3$.
 
-If only a single 8x8 matrix is loaded, the swizzle is sufficient to eliminate bank conflicts. However, as the number of 8x8 matrices loaded per instruction increases, bank conflicts become unavoidable since the banks must be reused with the additional elements to load. Specifically, using `.num` = `.x2` results in 2-way bank conflicts even with the swizzle applied, while `.num` = `.x4` leads to 4-way bank conflicts, matching the level of conflict observed without any swizzling.
+When only a single 8x8 matrix is loaded, the swizzle is sufficient to eliminate bank conflicts. However, as the number of 8x8 matrices loaded per instruction increases, bank conflicts become unavoidable because the additional elements must reuse the same banks. Specifically, using `.num` = `.x2` results in 2-way bank conflicts with the swizzle applied (which is an improvement over the 4-way bank conflicts observed without swizzling; see the figure below). With `.num` = `.x4`, bank conflicts rise to 4-way, matching the conflict level observed without any swizzle.
 
-![Original bank indices the elements of As are mapped to](/assets/images/2025-11-10-gemm/kernel14_as_before.png)
+![Original bank indices the elements of As are mapped to](/assets/images/2025-12-22-gemm/kernel14_as_before.png)
 <p style="text-align: center;"><i>The original bank indices the elements of <code>As</code> are mapped to where the four 8x8 matrices loaded by <code>ldmatrix</code> lead to 4-way bank conflicts.</i></p>
 
 Since swizzling does not reduce bank conflicts in this case, we do not apply it to `As`.
 
 **`Bs` data loads**
 
-In the current configuration, `Bs` has dimensions $16 \times 128$, which means that loading two 8x8 matrices leads to 16-way bank conflicts. By applying the same swizzle parameters discussed in the As data loads section (`MBase` = 3, `BBits` = 3, and `SShift` = 3), we are able to reduce these conflicts to just 2-way bank conflicts.
+In the current configuration, `Bs` has dimensions $16 \times 128$, which means that loading two 8x8 matrices vertically leads to 16-way bank conflicts. By applying the same swizzle parameters discussed in the As data loads section (`MBase` = 3, `BBits` = 3, and `SShift` = 3), we are able to reduce these conflicts to just 2-way bank conflicts.
 
-![Bank indices in Bs](/assets/images/2025-11-10-gemm/kernel14_bs.png)
+![Bank indices in Bs](/assets/images/2025-12-22-gemm/kernel14_bs.png)
 <p style="text-align: center;"><i>The original and the swizzled bank indices the elements in <code>Bs</code> are mapped to. The swizzle method reduces the bank conflicts from 16-way to 2-way.</i></p>
+
+The Python notebook that was used to produce the figures can be found [here](https://github.com/kathsucurry/cuda_matrix_multiplication/blob/main/notebooks/understanding_swizzle.ipynb).
 
 **Summary**
 
@@ -1811,11 +1822,11 @@ Applying the swizzle configuration to `Bs` boosts throughput to 84.24 TFLOPs/s, 
 
 # 7. Summary
 
-My original goal was simply to learn from Simon's post and implement a single tensor-core-based kernel, so I did not expect to end up exploring many additional techniques such as swizzling and pipelining. In practice, wrapping my head around warp tiling (especially the subdivided variant), along with understanding how to use `mma` instructions and apply swizzling, required a significant amount of effort. I'm glad I was able to work through and cover these topics. If you notice any mistakes, issues, or have any feedback at all, I would love to hear it!
+My original goal was simply to learn SGEMM optimization and implement a single Tensor Cores-based kernel, so I did not expect to end up exploring many additional techniques such as swizzling and pipelining. In my experience, wrapping my head around warp tiling (especially the subdivided variant), along with understanding how to use `mma` instructions and apply swizzling, required relatively more efforts. I'm glad I was able to work through and cover these topics. Again, if you notice any mistakes, issues, or have any feedback at all, I would love to hear it!
 
-Note that I did not perform extensive parameter tuning. Instead, I experimented with a limited number of configurations and selected one that produced reasonable good performance for the chosen values of $M$, $N$, and $K$. The same configuration is unlikely to be optimal for other matrix shapes.
+Note that I did not perform extensive parameter tuning. Instead, I experimented with a limited number of configurations and selected one that produced reasonably good performance for the chosen values of $M$, $N$, and $K$. The same configuration is unlikely to be optimal for other matrix shapes.
 
-Overall, this post focuses on optimizing both SGEMM and HGEMM. For matrices of size $M = N = K = 4096$, we achieve approximately **95% of cuBLAS performance for SGEMM** and **101% of cuBLAS performance for HGEMM**.
+Overall, this post focuses on optimizing both SGEMM and HGEMM. For matrices of size $M = N = K = 4096$, we achieve **beyond 95% of cuBLAS performance for SGEMM** and **beyond 101% of cuBLAS performance for HGEMM**.
 
 <hr class="hr-top" /><hr />
 
@@ -1830,6 +1841,7 @@ Overall, this post focuses on optimizing both SGEMM and HGEMM. For matrices of s
 
 - [Understanding the Roofline Model](https://accelerated-computing.academy/fall25/resources/roofline/) taken from MIT 6.S894: Accelerated Computing Resources page
 - Asynchronous Data Copies section, [Advanced Performance Optimization in CUDA](https://www.nvidia.com/en-us/on-demand/session/gtc24-s62192/) by Igor Terentyev (2024).
+- [Cute Swizzle implementation code](https://github.com/NVIDIA/cutlass/blob/b0e09d7cd371eded41f7c1e057caf1593c27ba55/include/cute/swizzle.hpp#L55).
 - [CuTe Swizzle](https://www.google.com/search?client=safari&rls=en&q=swizzle+in+cutlass&ie=UTF-8&oe=UTF-8) by Lei Mao (2024).
 - [NVIDIA Tensor Core Programming](https://leimao.github.io/blog/NVIDIA-Tensor-Core-Programming/) by Lei Mao (2023).
 - HGEMM example code: [Toy-HGEMM](https://github.com/xlite-dev/HGEMM) by DefTruth.
@@ -1839,3 +1851,7 @@ Overall, this post focuses on optimizing both SGEMM and HGEMM. For matrices of s
 - [CUDA C++ Programming Guide](https://docs.nvidia.com/cuda/cuda-c-programming-guide)
 - [Parallel Thread Execution ISA](https://docs.nvidia.com/cuda/parallel-thread-execution/)
 - [Inline PTX Assembly in CUDA](https://www.google.com/search?client=safari&rls=en&q=ptx+inline+documentation&ie=UTF-8&oe=UTF-8)
+
+**Others**
+
+- A significant number of questions and answers on the NVIDIA developer forums, where the majority were contributed by Robert Crovella.
