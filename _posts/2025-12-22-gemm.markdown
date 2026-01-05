@@ -1,12 +1,12 @@
 ---
 layout: post
-title:  "Optimizing SGEMM and HGEMM: Achieving >95% of cuBLAS Performance"
+title:  "GEMM: Achieving >95% and >101% of cuBLAS Performance in SGEMM and MP-GEMM"
 date:   2025-12-22
 categories: cuda
 katex: true
 ---
 
-It's widely known that implementing and optimizing GEMM (**GE**neral **M**atrix **M**ultiplication) is fundamental when it comes to learning GPU programming. In this post, we'll walk through the process of implementing and optimizing single-precision and half-precision GEMM: from a brief overview of what the operation does to advanced optimizations using Tensor Cores.
+It's widely known that implementing and optimizing GEMM (**GE**neral **M**atrix **M**ultiplication) is fundamental when it comes to learning GPU programming. In this post, we'll walk through the process of implementing and optimizing single-precision and mixed-precision GEMM: from a brief overview of what the operation does to advanced optimizations using Tensor Cores.
 
 I primarily use [Simon's](https://siboehm.com/articles/22/CUDA-MMM) GEMM posts as the foundation for this work. I begin by reimplementing the kernels from Simon's post and documenting the insights I gain along the way. For Tensor Core-based optimizations, I draw heavily from the notes and explanations in [Alex's](https://alexarmbr.github.io/2024/08/10/How-To-Write-A-Fast-Matrix-Multiplication-From-Scratch-With-Tensor-Cores.html#how-to-use-tensor-cores) post. I've listed other extremely helpful resources in the [Resources](#resources) section as well.
 
@@ -29,7 +29,7 @@ All performance measurements in this posts were taken on an RTX 5070 Ti and the 
 | kernel 08: asynchronous copy + double buffering | 30.28 | 95.64% |
 
 
-**HGEMM: >101% cuBLAS performance**
+**MP-GEMM: >101% cuBLAS performance**
 
 | Kernel # | Performance (TFLOPs/s) | % cuBLAS performance |
 |:---|:---:|:---:|:---:|
@@ -57,7 +57,7 @@ This post is organized into the following sections:
     - [**Kernel 07: Transposing `As`**](#kernel-07-transposing-as)
     - [**Kernel 08: Asynchronous global-memory loads + double buffering**](#kernel-08-asynchronous-global-memory-loads--double-buffering)
 5. [**Tensor Cores**](#5-tensor-cores)
-6. [**Half-precision GEMM implementation**](#6-half-precision-gemm-implementations)
+6. [**Mixed-precision GEMM implementation**](#6-mixed-precision-gemm-implementations)
     - [**Kernel 09: Tensor Cores (wmma API)**](#kernel-09-tensor-cores-wmma-api)
     - [**Kernel 10 & 11: Tensor Cores + asynchronous gmem loads + double buffering**](#kernel-10--11-tensor-cores--asynchronous-gmem-loads--double-buffering)
     - [**Kernel 12: Tensor Cores + three-level pipeline**](#kernel-12-tensor-cores--three-level-pipeline)
@@ -285,7 +285,7 @@ The usages of <code>__launch_bounds__()</code> and <code>__restrict__</code> are
 <!-- START OF DIV -->
 <div class="div-author-note">
 <h4>Author's Note</h4>
-If you look at the code, you'd notice that some basic kernel functions have been transformed into function templates so that it can be used for both single- and half-precision GEMMs. You can find the list of implemented kernels <a href="https://github.com/kathsucurry/cuda_matrix_multiplication/blob/main/src/kernels.cuh">here</a>.
+If you look at the code, you'd notice that some basic kernel functions have been transformed into function templates so that it can be used for both single- and mixed-precision GEMMs. You can find the list of implemented kernels <a href="https://github.com/kathsucurry/cuda_matrix_multiplication/blob/main/src/kernels.cuh">here</a>.
 </div>
 <!-- END OF DIV -->
 
@@ -1183,10 +1183,10 @@ We will examine these points in more details later, but essentially, Tensor Core
 
 <hr class="hr-top" /><hr />
 
-# 6. Half-precision GEMM implementations
+# 6. Mixed-precision GEMM implementations
 
 Tensor Cores do not currently support all data types. The available combinations of data types for the multiplicand and accumulator matrices are listed in [this table](https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-data-types). For instance, 
-among floating-point data types, there is currently no support for using FP32 for both the multiplicands and the accumulator. Because of that, we will focus on half-precision GEMM implementations in the rest of the post.
+among floating-point data types, there is currently no support for using FP32 for both the multiplicands and the accumulator. Because of that, we will focus on mixed-precision GEMM implementations in the rest of the post.
 
 In particular, we will use the 16-bit alternative floating-point data type BFloat16 (`.bf16`) for the multiplicands $A$ and $B$, and the 32-bit IEEE floating-point data type (`.f32`) for the accumulator $C$.
 
@@ -1205,11 +1205,11 @@ As shown in the figure above, BFloat16 has the same dynamic range as FP32 due to
 </div>
 <!-- END OF DIV -->
 
-To implement HGEMM, I begin by enabling half-precision computation in *some* of the SGEMM kernels implemented above and examine their performance relative to SGEMM. I then explore the use of Tensor Cores via the wmma APIs and mma instructions, and optimize the implementation from there. Each kernel implementation is compared against the updated cuBLAS performance on HGEMM.
+To implement MP-GEMM, I begin by enabling mixed-precision computation in *some* of the SGEMM kernels implemented above and examine their performance relative to SGEMM. I then explore the use of Tensor Cores via the wmma APIs and mma instructions, and optimize the implementation from there. Each kernel implementation is compared against the updated cuBLAS performance on MP-GEMM.
 
-The performance of some of the kernels already discussed on half-precision GEMM is as follows.
+The performance of some of the kernels already discussed on mixed-precision GEMM is as follows.
 
-| Kernel # | SGEMM Performance (TFLOPs/s) | HGEMM Performance (TFLOPs/s) | % HGEMM cuBLAS performance |
+| Kernel # | SGEMM Performance (TFLOPs/s) | MP-GEMM Performance (TFLOPs/s) | % MP-GEMM cuBLAS performance |
 |:---|:---:|:---:|:---:|
 | cuBLAS | 31.66 | 88.81 | 100% |
 | kernel 01: naive | 2.05 | 2.90 | 3.26% |
@@ -1218,7 +1218,7 @@ The performance of some of the kernels already discussed on half-precision GEMM 
 | kernel 05: warp tiling | 26.19 | 26.81 | 30.19% |
 | kernel 06: warp tiling, subdivided | 28.70 | 27.23 | 30.66% |
 
-While cuBLAS performance shoots up to 88.81 TFLOPs/s for HGEMM, kernels up to Kernel 06 show performance similar to SGEMM, so I stopped there and shifted focus to Tensor Cores. I also did not look into why the performance of Kernel 02 dropped in HGEMM - perhaps something to look into in the future.
+While cuBLAS performance shoots up to 88.81 TFLOPs/s for MP-GEMM, kernels up to Kernel 06 show performance similar to SGEMM, so I stopped there and shifted focus to Tensor Cores. I also did not look into why the performance of Kernel 02 dropped in MP-GEMM - perhaps something to look into in the future.
 
 The kernels using Tensor Cores are as follows.
 
@@ -1854,7 +1854,7 @@ My original goal was simply to learn SGEMM optimization and implement a single T
 
 Note that I did not perform extensive parameter tuning. Instead, I experimented with a limited number of configurations and selected one that produced reasonably good performance for the chosen values of $M$, $N$, and $K$. The same configuration is unlikely to be optimal for other matrix shapes.
 
-Overall, this post focuses on optimizing both SGEMM and HGEMM. For matrices of size $M = N = K = 4096$, we achieve **beyond 95% of cuBLAS performance for SGEMM** and **beyond 101% of cuBLAS performance for HGEMM**.
+Overall, this post focuses on optimizing both SGEMM and MP-GEMM. For matrices of size $M = N = K = 4096$, we achieve **beyond 95% of cuBLAS performance for SGEMM** and **beyond 101% of cuBLAS performance for MP-GEMM**.
 
 <hr class="hr-top" /><hr />
 
