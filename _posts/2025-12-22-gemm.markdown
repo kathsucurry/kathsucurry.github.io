@@ -17,7 +17,7 @@ All performance measurements in this posts were taken on an RTX 5070 Ti and the 
 **SGEMM: >95% cuBLAS performance**
 
 | Kernel # | Performance (TFLOPs/s) | % cuBLAS performance |
-|:---|:---:|:---:|:---:|
+|:---|:---:|:---:|
 | cuBLAS | 31.66 | 100% |
 | kernel 01: naive | 2.05 | 6.47% |
 | kernel 02: block tiling | 3.49 | 11.02% |
@@ -32,15 +32,15 @@ All performance measurements in this posts were taken on an RTX 5070 Ti and the 
 **MP-GEMM: >101% cuBLAS performance**
 
 | Kernel # | Performance (TFLOPs/s) | % cuBLAS performance |
-|:---|:---:|:---:|:---:|
+|:---|:---:|:---:|
 | cuBLAS | 88.81 | 100% |
 | kernel 09: tensor cores (wmma API) | 65.38 | 73.62% |
 | kernel 10: tensor cores + async gmem loads  | 73.77 | 83.06% |
 | kernel 11: tensor cores + double buffering | 80.33 | 90.45% |
-| kernel 12: tensor cores + three-level pipeline | 87.13 | 98.11% |
+| kernel 12: tensor cores + three-stage pipeline | 87.13 | 98.11% |
 | kernel 13: tensor cores (mma) | 76.93 | 86.62% |
 | kernel 14: tensor cores (mma) swizzled | 84.24 | 94.85% |
-| kernel 15: tensor cores (mma) swizzled + three-level pipeline | 90.31 | 101.69% |
+| kernel 15: tensor cores (mma) swizzled + three-stage pipeline | 90.31 | 101.69% |
 
 This post is organized into the following sections:
 
@@ -60,9 +60,9 @@ This post is organized into the following sections:
 6. [**Mixed-precision GEMM implementation**](#6-mixed-precision-gemm-implementations)
     - [**Kernel 09: Tensor Cores (wmma API)**](#kernel-09-tensor-cores-wmma-api)
     - [**Kernel 10 & 11: Tensor Cores + asynchronous gmem loads + double buffering**](#kernel-10--11-tensor-cores--asynchronous-gmem-loads--double-buffering)
-    - [**Kernel 12: Tensor Cores + three-level pipeline**](#kernel-12-tensor-cores--three-level-pipeline)
+    - [**Kernel 12: Tensor Cores + three-stage pipeline**](#kernel-12-tensor-cores--three-stage-pipeline)
     - [**Kernel 13: Tensor Cores (mma instructions)**](#kernel-13-tensor-cores-mma-instructions)
-    - [**Kernel 14 & 15: Swizzled shared memory + three-level pipeline**](#kernel-14--15-swizzled-shared-memory--three-level-pipeline)
+    - [**Kernel 14 & 15: Swizzled shared memory + three-stage pipeline**](#kernel-14--15-swizzled-shared-memory--three-stage-pipeline)
 6. [**Summary**](#7-summary)
 
 <hr class="hr-top" /><hr />
@@ -312,7 +312,7 @@ The kernel code can then be invoked using the following host code:
 which yields the following performance:
 
 | Kernel # | Performance | % cuBLAS performance |
-|:---|:---:|:---:|:---:|
+|:---|:---:|:---:|
 | cuBLAS | 31.66 TFLOPs/s | 100% |
 | kernel 01: naive 🆕 | 2.05 TFLOPs/s | 6.47% |
 
@@ -455,7 +455,7 @@ Once I grasped it, while shifting the pointers does simplify the code, I found t
 With the tiling method described above, each element in matrix $A$ in global memory is now accessed only `N / BLOCK_DIM` times, and each element of matrix $B$ is accessed only `M / BLOCK_DIM` times. This reduction happens because each `BLOCK_DIM x BLOCK_DIM` tile is loaded into shared memory once and then reused by all threads in the block, significantly cutting down redundant global memory accesses. As a result, it leads to the following performance increase:
 
 | Kernel # | Performance | % cuBLAS performance |
-|:---|:---:|:---:|:---:|
+|:---|:---:|:---:|
 | cuBLAS | 31.66 TFLOPs/s | 100% |
 | kernel 01: naive | 2.05 TFLOPs/s | 6.47% |
 | kernel 02: block tiling 🆕  | 3.49 TFLOPs/s | 11.02% |
@@ -625,7 +625,7 @@ The figure below illustrates an example of how `stride_A` and `stride_B` are use
 This kernel achieves the following performance, marking a significant jump compared to the previous implementation.
 
 | Kernel # | Performance | % cuBLAS performance |
-|:---|:---:|:---:|:---:|
+|:---|:---:|:---:|
 | cuBLAS | 31.66 TFLOPs/s | 100% |
 | kernel 01: naive | 2.05 TFLOPs/s | 6.47% |
 | kernel 02: block tiling | 3.49 TFLOPs/s | 11.02% |
@@ -721,7 +721,7 @@ Note that `.nc` in `ld.global.nc.v4.u32` stands for *non-coherent cache*. It ind
 We now achieve 26.01 TFLOP/s, which is about 80% of the cuBLAS performance!
 
 | Kernel # | Performance | % cuBLAS performance |
-|:---|:---:|:---:|:---:|
+|:---|:---:|:---:|
 | cuBLAS | 31.66 TFLOPs/s | 100% |
 | kernel 01: naive | 2.05 TFLOPs/s | 6.47% |
 | kernel 02: block tiling | 3.49 TFLOPs/s | 11.02% |
@@ -791,7 +791,7 @@ Once we update the offsets when shifting $A$, $B$, and $C$'s pointers, the rest 
 Performance-wise, however, we don't really see much differences  between Kernel 04 and Kernel 05:
 
 | Kernel # | Performance | % cuBLAS performance |
-|:---|:---:|:---:|:---:|
+|:---|:---:|:---:|
 | cuBLAS | 31.66 TFLOPs/s | 100% |
 | kernel 01: naive | 2.05 TFLOPs/s | 6.47% |
 | kernel 02: block tiling | 3.49 TFLOPs/s | 11.02% |
@@ -890,7 +890,7 @@ for (int wmiter_idx{0}; wmiter_idx < WMITER; ++wmiter_idx)
 These modifications lead to a performance of 28.70 TFLOPs/s, which is more than 90% of cuBLAS!
 
 | Kernel # | Performance | % cuBLAS performance |
-|:---|:---:|:---:|:---:|
+|:---|:---:|:---:|
 | cuBLAS | 31.66 TFLOPs/s | 100% |
 | kernel 01: naive | 2.05 TFLOPs/s | 6.47% |
 | kernel 02: block tiling | 3.49 TFLOPs/s | 11.02% |
@@ -1006,7 +1006,7 @@ After applying these modifications, generating the PTX instructions should now s
 Overall, transposing `As` leads to a noticeable improvement compared to Kernel 06!
 
 | Kernel # | Performance | % cuBLAS performance |
-|:---|:---:|:---:|:---:|
+|:---|:---:|:---:|
 | cuBLAS | 31.66 TFLOPs/s | 100% |
 | kernel 01: naive | 2.05 TFLOPs/s | 6.47% |
 | kernel 02: block tiling | 3.49 TFLOPs/s | 11.02% |
@@ -1099,7 +1099,7 @@ For each sliding tile with length $BK$ across $K$, we currently perform shared-m
 To further hide the data transfer latency, we can overlap the computation with data transfer illustrated as follows.
 
 ![The new pipeline in Kernel 09](/assets/images/2025-12-22-gemm/kernel8_intro_now.png)
-<p style="text-align: center;"><i>The pipeline we aim to use in Kernel 09 to hide data transfer latency.</i></p>
+<p style="text-align: center;"><i>The pipelining approach we aim to use in Kernel 09 to hide data transfer latency.</i></p>
 
 To enable this, we introduce an additional shared-memory buffer: one buffer holds the data currently used for computation, while the other preloads the next data tile, hence, the name **double buffering**.
 
@@ -1147,7 +1147,7 @@ Note that I had to scale down the shared-memory usage by reducing $BK$ from 32 t
 The updated performance table can be found below.
 
 | Kernel # | Performance (TFLOPs/s) | % cuBLAS performance |
-|:---|:---:|:---:|:---:|
+|:---|:---:|:---:|
 | cuBLAS | 31.66 | 100% |
 | kernel 01: naive | 2.05 | 6.47% |
 | kernel 02: block tiling | 3.49 | 11.02% |
@@ -1224,9 +1224,9 @@ The kernels using Tensor Cores are as follows.
 
 1. [**Kernel 09: Tensor Cores (wmma API)**](#kernel-09-tensor-cores-wmma-api)
 2. [**Kernel 10 & 11: Tensor Cores + asynchronous gmem loads + double buffering**](#kernel-10--11-tensor-cores--asynchronous-gmem-loads--double-buffering)
-4. [**Kernel 12: Tensor Cores + three-level pipeline**](#kernel-12-tensor-cores--three-level-pipeline)
+4. [**Kernel 12: Tensor Cores + three-stage pipeline**](#kernel-12-tensor-cores--three-stage-pipeline)
 5. [**Kernel 13: Tensor Cores (mma instructions)**](#kernel-13-tensor-cores-mma-instructions)
-6. [**Kernel 14 & 15: Swizzled shared memory + three-level pipeline**](#kernel-14--15-swizzled-shared-memory--three-level-pipeline)
+6. [**Kernel 14 & 15: Swizzled shared memory + three-stage pipeline**](#kernel-14--15-swizzled-shared-memory--three-stage-pipeline)
 
 <hr />
 
@@ -1353,7 +1353,7 @@ Unlike <code>wmma</code>, using <code>mma</code> requires understanding the layo
 The performance of the kernel can be found in the table below. As we can see, utilizing Tensor Cores significantly improves the throughput to around 70% of cuBLAS performance!
 
 | Kernel # | Performance (TFLOPs/s) | % cuBLAS performance |
-|:---|:---:|:---:|:---:|
+|:---|:---:|:---:|
 | cuBLAS | 88.81 | 100% |
 | kernel 06: warp tiling, subdivided | 27.23 | 30.66% |
 | kernel 09: tensor cores (wmma API) 🆕 | 65.38 | 73.62% |
@@ -1380,7 +1380,7 @@ In both Kernel 10 and 11, we apply the two optimization techniques from Kernel 0
 These modifications result in the following performance improvements:
 
 | Kernel # | Performance (TFLOPs/s) | % cuBLAS performance |
-|:---|:---:|:---:|:---:|
+|:---|:---:|:---:|
 | cuBLAS | 88.81 | 100% |
 | kernel 06: warp tiling, subdivided | 27.23 | 30.66% |
 | kernel 09: tensor cores (wmma API) | 65.38 | 73.62% |
@@ -1389,7 +1389,7 @@ These modifications result in the following performance improvements:
 
 <hr />
 
-#### Kernel 12: Tensor Cores + three-level pipeline
+#### Kernel 12: Tensor Cores + three-stage pipeline
 
 In Kernel 08, we define two levels for overlapping: shared-memory stores and dot-product computation. The dot-product computation itself, however, can be further divided into two steps: (1) register stores and (2) the actual dot-product computation. What if we try overlapping all these three steps, as illustrated below?
 
@@ -1509,7 +1509,7 @@ compute_dot_products(A_frags, B_frags, acc_frags); // last tile.
 With these modifications, we're able to keep register usage sufficiently low and reach 98% of cuBLAS performance!
 
 | Kernel # | Performance (TFLOPs/s) | % cuBLAS performance |
-|:---|:---:|:---:|:---:|
+|:---|:---:|:---:|
 | cuBLAS | 88.81 | 100% |
 | kernel 01: naive | 2.90 | 3.26% |
 | kernel 02: block tiling | 2.80 | 3.15% |
@@ -1519,7 +1519,7 @@ With these modifications, we're able to keep register usage sufficiently low and
 | kernel 09: tensor cores (wmma API) | 65.38 | 73.62% |
 | kernel 10: tensor cores + async gmem loads | 73.77 | 83.06% |
 | kernel 11: tensor cores + double buffering | 80.33 | 90.45% |
-| kernel 12: tensor cores + three-level pipeline 🆕 | 87.13 | 98.11% |
+| kernel 12: tensor cores + three-stage pipeline 🆕 | 87.13 | 98.11% |
 
 <hr />
 
@@ -1722,13 +1722,13 @@ reinterpret_cast<float2 *>(&C_pointer[(fragment_row_offset + 8) * N + fragment_c
 Unfortunately, we can't directly compare the performance with Kernel 09 given the different supported matrix sizes. But using `mma` instructions along with shared-memory stores from Kernel 10 already yields a promising throughput of 76.93 TFLOPs/s.
 
 | Kernel # | Performance (TFLOPs/s) | % cuBLAS performance |
-|:---|:---:|:---:|:---:|
+|:---|:---:|:---:|
 | cuBLAS | 88.81 | 100% |
 | kernel 06: warp tiling, subdivided | 27.23 | 30.66% |
 | kernel 09: tensor cores (wmma API) | 65.38 | 73.62% |
 | kernel 10: tensor cores + async gmem loads  | 73.77 | 83.06% |
 | kernel 11: tensor cores + double buffering | 80.33 | 90.45% |
-| kernel 12: tensor cores + three-level pipeline | 87.13 | 98.11% |
+| kernel 12: tensor cores + three-stage pipeline | 87.13 | 98.11% |
 | kernel 13: tensor cores (mma) 🆕 | 76.93 | 86.62% |
 
 <!-- START OF DIV -->
@@ -1740,7 +1740,7 @@ You can read the <a href="https://docs.nvidia.com/cuda/inline-ptx-assembly/index
 
 <hr />
 
-#### Kernel 14 & 15: Swizzled shared memory + three-level pipeline
+#### Kernel 14 & 15: Swizzled shared memory + three-stage pipeline
 
 We touched on shared memory bank conflicts briefly when implementing Kernel 07 (transposing `As`). As a reminder:
 - Shared memory is divided into 32 equally-sized banks, each bank can handle one 4-byte load or store operation per clock cycle. In our case, two consecutive BFloat16 elements share a single bank.
@@ -1832,19 +1832,19 @@ The Python notebook that was used to produce the figures can be found [here](htt
 
 **Summary**
 
-Applying the swizzle configuration to `Bs` boosts throughput to 84.24 TFLOPs/s, and incorporating the three-level pipelining technique from Kernel 12 further increases it to 90.31 TFLOPs/s, exceeding 100% of cuBLAS performance!
+Applying the swizzle configuration to `Bs` boosts throughput to 84.24 TFLOPs/s, and incorporating the three-stage pipelining technique from Kernel 12 further increases it to 90.31 TFLOPs/s, exceeding 100% of cuBLAS performance!
 
 | Kernel # | Performance (TFLOPs/s) | % cuBLAS performance |
-|:---|:---:|:---:|:---:|
+|:---|:---:|:---:|
 | cuBLAS | 88.81 | 100% |
 | kernel 06: warp tiling, subdivided | 27.23 | 30.66% |
 | kernel 09: tensor cores (wmma API) | 65.38 | 73.62% |
 | kernel 10: tensor cores + async gmem loads  | 73.77 | 83.06% |
 | kernel 11: tensor cores + double buffering | 80.33 | 90.45% |
-| kernel 12: tensor cores + three-level pipeline | 87.13 | 98.11% |
+| kernel 12: tensor cores + three-stage pipeline | 87.13 | 98.11% |
 | kernel 13: tensor cores (mma) | 76.93 | 86.62% |
 | kernel 14: tensor cores (mma) swizzled 🆕 | 84.24 | 94.85% |
-| kernel 15: tensor cores (mma) swizzled + three-level pipeline 🆕 | 90.31 | 101.69% |
+| kernel 15: tensor cores (mma) swizzled + three-stage pipeline 🆕 | 90.31 | 101.69% |
 
 <hr class="hr-top" /><hr />
 
