@@ -5,7 +5,7 @@ date:   2026-01-13
 categories: parallel computing
 ---
 
-This post presents my notes from watching **CS149: Parallel Computing**, a Stanford course on parallel systems and performance. The course webpage can be found [here](https://gfxcourses.stanford.edu/cs149/fall25). These notes cover the fundamental part of the course, spanning Lectures 1 through 7:
+I've been wondering where to put my notes from watching **CS149: Parallel Computing**, a Stanford course on parallel systems and performance, so I decided to collect them in a post instead. The course webpage can be found [here](https://gfxcourses.stanford.edu/cs149/fall25). These notes cover the fundamental part of the course, spanning Lectures 1 through 7, and were created using [Excalidraw](https://excalidraw.com):
 
 - [Lecture 1: Why Parallelism? Why Efficiency?](#lecture-1)
 - [Lecture 2: A Modern Multi-core Processor](#lecture-2)
