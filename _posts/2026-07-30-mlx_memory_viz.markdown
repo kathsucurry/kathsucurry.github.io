@@ -21,6 +21,7 @@ The post is organized into the following sections:
   - [The allocator](#the-allocator)
   - [Computation graph construction](#computation-graph-construction)
   - [When `eval` is triggered](#when-eval-is-triggered)
+- [Plan 3: Bridge the two](#plan-3-bridge-the-two)
       
 
 # Motivation
@@ -346,3 +347,72 @@ When we run `mx.eval(out1, out2, out3)` at the end, it passes through [these lin
     ```
 
 3. [Run the operations in the tape](https://github.com/ml-explore/mlx/blob/255f953f99c3403df19fa4d92462143139c3dfff/mlx/transforms.cpp#L228-L307). Each primitive is invoked in [these lines](https://github.com/ml-explore/mlx/blob/255f953f99c3403df19fa4d92462143139c3dfff/mlx/transforms.cpp#L264-L268), and **that is where output buffers are allocated**.
+
+<hr class="hr-top" /><hr />
+
+# Plan 3: Bridge the two
+
+Recall that in PyTorch, whenever recording is enabled and it's GIL-safe (i.e., when the thread legally holds the GIL), the Python stack is gathered *synchronously during the alloc/free call* and passed to the trace-recording function placed in the allocator.
+
+In MLX, however, while it's still straightforward to place the recording function in the allocator, its lazy computation design means the Python context has to be captured separately. This is because by the time the allocation happens, the Python frame that created the array is long gone. One idea is to capture the context *during* graph construction instead. As discussed earlier, `array`-related Python operations that may end up with allocations all pass through `ArrayDesc`'s `init()`, so we can record the context there and **carry it on the array descriptor `array_desc_`**, then to be picked up by the memory trace entry when the buffer is eventually allocated.
+
+Here are the implementation steps. My main goal at this point is a working prototype, so I'm not worrying much about optimization, and I might overlook some details. Some naming may also change in the future.
+
+1. Enable recording memory events.
+2. Enable retrieving the recorded events from the Python side (mainly for testing purposes).
+3. Capture the primitive name associated with each event.
+4. Implement traceback capture.
+5. Symbolize tracebacks into filename, function name, and line number.
+6. Format the output to match PyTorch's snapshot format.
+
+<hr class="hr-single" />
+
+### 1. Enable recording memory events.
+
+This step entails the following substeps:
+
+   - [Backend] Implement a recording function, along with a class representing a memory event, and call it from the allocator's allocation and deallocation paths.
+   - [Backend] Ensure the memory event class contains a flag to indicate whether the recording is enabled or not.
+   - [Python-facing] Provide a functionality to toggle the recording functionality (similar to PyTorch's `_record_memory_history()`).
+   - [Python-facing] Expose the captured events to Python (for testing purposes).
+
+### 2. Capture the primitive name associated with each event.
+
+To record which primitive an allocation/deallocation belongs to, we need to get the primitive's name from `array` down to the event recording function. Recall from the [`eval` description section](when-eval-is-triggered) that primitives are invoked in [these lines](https://github.com/ml-explore/mlx/blob/255f953f99c3403df19fa4d92462143139c3dfff/mlx/transforms.cpp#L264-L268) where `arr` is passed to either `gpu::eval()` or `cpu::eval()`.
+
+One solution is to thread the name through the call path, passing it alongside `arr` all the way down to where memory is allocated or freed. The problem is that the call path can get tedious, so plumbing an extra argument through every branch that might allocate/deallocate gets messy pretty fast...
+
+Another solution is to create a context object: an object that stores information at one point in the call stack so it can be read further down without being passed explicitly. We Implement two structs in `mlx/op_context.h`:
+
+```c++
+struct OpInfo {
+  std::string_view primitive_name;
+};
+
+inline thread_local OpInfo current_op;
+
+struct OpContext {
+  explicit OpContext(std::string_view primitive_name) {
+    current_op = {.primitive_name = primitive_name};
+  }
+  ~OpContext() {
+    current_op = {};
+  }
+
+  OpContext(const OpContext&) = delete;
+  OpContext& operator=(const OpContext&) = delete;
+};
+```
+
+We can then set the primitive name right before `gpu::eval(arr)` or `cpu::eval(arr)` and read it back inside the memory event recording function. That way, the allocator is able to pick it up no matter how deep the call path goes.
+
+4. [Backend] Implement traceback capture.
+
+5. [Backend] Symbolize tracebacks into filename, function name, and line number.
+
+6. [Python-facing] Format the output to match PyTorch's snapshot format.
+
+
+
+To be optimized:
+- use ring buffer instead
