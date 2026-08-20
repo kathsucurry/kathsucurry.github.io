@@ -22,7 +22,13 @@ The post is organized into the following sections:
   - [Computation graph construction](#computation-graph-construction)
   - [When `eval` is triggered](#when-eval-is-triggered)
 - [Plan 3: Bridge the two](#plan-3-bridge-the-two)
-      
+  - [1. Enable recording memory events.](#1-enable-recording-memory-events)
+  - [2. Capture the primitive name associated with each event.](#2-capture-the-primitive-name-associated-with-each-event)
+  - [3. Implement traceback capture.](#3-implement-traceback-capture)
+  - [4. Format the output to match PyTorch's snapshot format.](#4-format-the-output-to-match-pytorchs-snapshot-format)
+- [Summary](#summary)
+
+My implementation can be found [here](https://github.com/kathsucurry/mlx).
 
 # Motivation
 
@@ -222,8 +228,6 @@ Let's start with `python_support_`, a linked list of unwinders that is a static 
 
 When [`CapturedTraceback::gather()`](https://github.com/pytorch/pytorch/blob/68b353e2d8b7879b819209055f5524d0e7a1e9d1/torch/csrc/profiler/combined_traceback.cpp#L8) is called with `python = True`, it walks the unwinder linked list until an unwinder can and does gather Python frames. For each, it first checks [`PythonTraceback::canGather()`](https://github.com/pytorch/pytorch/blob/68b353e2d8b7879b819209055f5524d0e7a1e9d1/torch/csrc/profiler/python/combined_traceback.cpp#L27) (GIL safety on the current thread). If safe, it calls [`PythonTraceback::gather()`](https://github.com/pytorch/pytorch/blob/68b353e2d8b7879b819209055f5524d0e7a1e9d1/torch/csrc/profiler/python/combined_traceback.cpp#L44), which gets the current frame via `PyEval_GetFrame()` and walks up the stack (`PyFrame_GetBack()`), storing `(code, lasti)` per frame. Once frames are captured, the loop stops and does not visit remaining unwinders (if any).
 
-# TODO: explain block and segment?
-
 <hr class="hr-top" /><hr />
 
 # Plan 2: Understand MLX's side
@@ -358,12 +362,10 @@ In MLX, however, while it's still straightforward to place the recording functio
 
 Here are the implementation steps. My main goal at this point is a working prototype, so I'm not worrying much about optimization, and I might overlook some details. Some naming may also change in the future.
 
-1. Enable recording memory events.
-2. Enable retrieving the recorded events from the Python side (mainly for testing purposes).
-3. Capture the primitive name associated with each event.
-4. Implement traceback capture.
-5. Symbolize tracebacks into filename, function name, and line number.
-6. Format the output to match PyTorch's snapshot format.
+1. [Enable recording memory events.](#1-enable-recording-memory-events)
+2. [Capture the primitive name associated with each event.](#2-capture-the-primitive-name-associated-with-each-event)
+3. [Implement traceback capture.](#3-implement-traceback-capture)
+4. [Format the output to match PyTorch's snapshot format.](#4-format-the-output-to-match-pytorchs-snapshot-format)
 
 <hr class="hr-single" />
 
@@ -375,6 +377,8 @@ This step entails the following substeps:
    - [Backend] Ensure the memory event class contains a flag to indicate whether the recording is enabled or not.
    - [Python-facing] Provide a functionality to toggle the recording functionality (similar to PyTorch's `_record_memory_history()`).
    - [Python-facing] Expose the captured events to Python (for testing purposes).
+
+<hr class="hr-single" />
 
 ### 2. Capture the primitive name associated with each event.
 
@@ -406,13 +410,97 @@ struct OpContext {
 
 We can then set the primitive name right before `gpu::eval(arr)` or `cpu::eval(arr)` and read it back inside the memory event recording function. That way, the allocator is able to pick it up no matter how deep the call path goes.
 
-4. [Backend] Implement traceback capture.
+<hr class="hr-single" />
 
-5. [Backend] Symbolize tracebacks into filename, function name, and line number.
+### 3. Implement traceback capture.
 
-6. [Python-facing] Format the output to match PyTorch's snapshot format.
+Possibly the most challenging part of the implementation for me. I relied heavily on Claude Code for this one due to my lack of experience.
 
+#### Challenges
 
+In both PyTorch and MLX, there is a Python layer and a C++ layer. The allocator runs in pure C++ and handles allocations, deallocations, and trace recording. Meanwhile, we want to capture Python stacks and attach the captured `PyObject`s to the recorded trace entries. Here is the catch: the allocator cannot include Python headers (i.e., cannot use `PyObject`). PyTorch solves this with the three layers illustrated in Figure 6 below.
 
-To be optimized:
-- use ring buffer instead
+![The layering design in PyTorch](/assets/images/2026-07-30-mlx_memory_viz/plan3_pytorch.png)
+<p style="text-align: center;"><i>Figure 6. The layering design in PyTorch.</i></p>
+
+1. **Layer 1**: The allocator sees only an opaque `GatheredContext` and invokes `context_recorder_` (which we discussed earlier) to produce one.
+2. **Layer 2**: torch C++ sees the `PyFrame` type, which stores the frame's code object as a `void*` rather than a `PyObject*`. A `void*` can be stored, moved, and compared, but never dereferenced, meaning, this layer cannot INCREF, DECREF, or read a filename. Anything that needs to *interpret* the pointer goes through a virtual interface that Layer 3 registers at import time.
+3. **Layer 3**: The Python binding file, which implements all the Python-specific operations, from walking the frame stack, resolving frames to filenames and line numbers, to releasing references.
+
+<!-- START OF DIV -->
+<div class="div-interested">
+<h4>If You're Curious...</h4>
+
+<code>Py_INCREF()</code> and <code>Py_DECREF()</code> are Python C APIs for managing an object's reference count. When <code>Py_DECREF()</code> brings the count to zero, it immediately invokes the object's deallocator, which releases the object.
+</div>
+<!-- END OF DIV -->
+
+Here is where the problem lies. Layer 2 *owns* strong references to code objects but cannot safely release them. Releasing means `Py_DECREF`, which may only be called when holding the GIL, and `~CapturedTraceback` can run on a thread that is currently holding the allocator's device lock. Acquiring the GIL there can deadlock (explained in the comments [here](https://github.com/pytorch/pytorch/blob/68b353e2d8b7879b819209055f5524d0e7a1e9d1/torch/csrc/profiler/python/combined_traceback.cpp#L10-L21)): one thread holds the GIL and waits for the device lock, while another holds the device lock and waits for the GIL. So instead of freeing immediately, the destructor defers. It pushes the doomed frame pointers onto a global `to_free_frames` vector. The actual `Py_DECREF`s happen at the top of the next `gather()` call, which by construction holds the GIL and runs outside the device lock.
+
+#### Solution
+
+To mitigate this problem, instead of passing the `PyObject*` (in the form of `void*`) to the allocator, we can intern each captured stack in a table on the Python side and pass an integer ID into the memory event recording instead. The table owns the only references to the code objects and never releases them during a session, so destroying a memory event just destroys an integer (no `Py_DECREF` and no GIL).
+
+This entails the following steps:
+
+1. In `mlx/traceback.h|cpp`, implement the hook mechanism: `set_traceback_tracking()` to enable tracking, `set_traceback_capture_func()` to install the capture hook, and `capture_traceback()` to invoke the hook. `capture_traceback()` returns a `TracebackId`, and the core only transports it.
+
+2. Add a new `ArrayDesc` field `traceback` for storing the traceback ID.
+
+3. Capture the traceback when the `ArrayDesc` is created (we discussed earlier how the `init()` function can be a reliable capture point): 
+  ```c++
+  void array::ArrayDesc::init() {
+    ...
+    traceback = detail::capture_traceback();
+  }
+  ```
+
+4. Add the traceback ID to `OpInfo`, so the thread-local `current_op` can carry it from the eval loop to the allocator.
+
+5. Pass the array's traceback ID when constructing `op_context` in `transforms.cpp`.
+
+6. Add a traceback ID field in `MemoryEvent`.
+
+7. Call `set_traceback_tracking(enabled)` in `record_memory_event()` (next to the existing `set_op_tracking(enabled)`), and attach the traceback in `maybe_record_events()`:
+  ```c++
+  if (MemoryEvent::is_alloc(action)) {
+    event.primitive_name = detail::current_op.primitive_name;
+    // Add the lines below.
+    event.traceback = detail::current_op.traceback != detail::no_traceback
+        ? detail::current_op.traceback
+        : detail::capture_traceback();
+  }
+  ```
+  The fallback in the last line exists for leaf arrays. Leaf arrays allocate eagerly at construction without `eval()`, so no `OpContext` ever runs and `current_op` carries no ID. Consequently, the ID sitting in `ArrayDesc` is unreachable from the allocator, whose interface is just `malloc(size)`. But leaf construction happens on the Python thread with the GIL held, so the allocator can simply capture directly. This is safe because the capture function *never attempts* to acquire GIL; it only checks if GIL is held. In other use cases (the eval path), the check fails and the fallback harmlessly returns `no_traceback` (though `current_op` already has the ID anyway).
+
+8. Implement the capture function itself in `python/src/traceback.h|cpp`, along with the interning table. For deduplication, the table hashes each captured stack. I picked the Fowler–Noll–Vo hash since the choice isn't critical (the hash only acts as a prefilter here).
+
+9. Also in `python/src/traceback.h|cpp`, implement `resolve_traceback(TracebackId id)`, which turns an ID back into a readable stack: a list of `(filename, function name, line number)` tuples, ordered outermost frame first to match Python's own traceback convention. This is called from the `get_memory_events()` binding.
+
+<hr class="hr-single" />
+
+### 4. Format the output to match PyTorch's snapshot format.
+
+PyTorch's snapshot dictionary [contains the following fields](https://github.com/pytorch/pytorch/blob/e4bdcb097b91e69f2cd74789d7cc51703c617ce4/torch/csrc/cuda/Module.cpp#L1027-L1032): `segments`, `device_traces`, `allocator_settings`, `external_annotations`, `host_segments`, and `host_traces`. For our first prototype, we'll only implement `device_traces` and leave `segments` as an empty list.
+
+Since we already have `mx.get_memory_events()`, we just need a function that reformats its output into a form the memory viz web app can load. Note that we want to handle two different timelines:
+
+1. **Active memory**: the memory arrays are actually using right now.
+  - Allocation actions: `{"AllocNew", "AllocReuse", "AllocMakeBuffer"}`, to be replaced with `alloc`
+  - Free actions: `{"FreeActiveToCache", "FreeActiveToOS", "Release"}`, to be replaced with `free_completed`
+2. **Reserved memory**: the memory taken from the OS that hasn't been released yet, i.e., active memory + what's retained in the cache
+  - Relevant allocation actions: `{"AllocNew", "AllocMakeBuffer"}`, to be replaced with `segment_alloc`
+  - Relevant free actions: `{"FreeActiveToOS", "Release", "FreeCacheToOS"}`, to be replaced with `segment_free`
+
+Since I don't currently capture C++ stacks, the primitive name carries most of the useful signal. In my current implementation, primitives are used as event categories, which the viewer displays as graph colors and legend entries. The problem is that there's only a limited number of colors, so distinct primitives end up sharing one. To work around this, I also added the primitive name to the user metadata, where it shows up as text (shown in the figure below).
+
+![User metadata in memory viz](/assets/images/2026-07-30-mlx_memory_viz/plan3_user_metadata.png)
+<p style="text-align: center;"><i>Figure 7. User metadata displayed on memory viz.</i></p>
+
+<hr class="hr-top" /><hr />
+
+# Summary
+
+To reiterate, the goal of this post was to help myself work through the designs behind PyTorch and MLX, and my reasoning for how I implemented memory viz for MLX. I'm still learning, and the implementation is only at the prototype stage. I feel my explanations could use more of the big picture, and I'd welcome any corrections.
+
+Overall this has been a great learning experience. Everything I picked up about C++ along the way also led me to discover some really helpful CppCon talks! I don't know where this project will go, but I hope it turns out to be useful to others too.
