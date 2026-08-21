@@ -9,6 +9,7 @@ The main goal of this write-up is mostly to help myself understand what I'm actu
 
 The post is organized into the following sections:
 
+- [How to use](#how-to-use)
 - [Motivation](#motivation)
 - [The plan](#the-plan)
 - [Plan 1: Understand PyTorch's side](#plan-1-understand-pytorchs-side)
@@ -28,7 +29,32 @@ The post is organized into the following sections:
   - [4. Format the output to match PyTorch's snapshot format.](#4-format-the-output-to-match-pytorchs-snapshot-format)
 - [Summary](#summary)
 
-My implementation can be found [here](https://github.com/kathsucurry/mlx).
+My implementation can be found [here](https://github.com/kathsucurry/mlx/tree/memory-viz).
+
+# How to use
+
+Use the MLX version [here](https://github.com/kathsucurry/mlx/tree/memory-viz).
+
+```python
+import mlx.core as mx
+from mlx._memory_viz import dump_snapshot
+
+# 1. Turn on the recording.
+mx.record_memory_events(enabled=True, max_entries=100000)
+
+# 2. Add things to record.
+# ...
+
+# 3. Get the memory events
+# 3.1. Get a list of event dictionaries.
+events = mx.get_memory_events()
+
+# 3.2. Dump the events into a pickle file compatible with PyTorch's memory viz.
+dump_snapshot(mx.get_memory_events(), "output.pickle")
+
+# 4. Turn off the recording.
+mx.record_memory_events(enabled=False)
+```
 
 # Motivation
 
