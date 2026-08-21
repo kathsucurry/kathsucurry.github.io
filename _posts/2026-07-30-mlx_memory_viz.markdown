@@ -61,9 +61,7 @@ Then open the <code>.gputrace</code> in Xcode. This is a powerful tool, but to m
 
 </div>
 
-I really like PyTorch's [memory snapshot visualization](https://pytorch.org/blog/understanding-gpu-memory-1/) where I can record allocation history, dump a pickle, and drop it into [docs.pytorch.org/memory_viz](https://docs.pytorch.org/memory_viz), and see how each allocation is tied back to the code line that made it.
-
-So I decided to build one for MLX. Specifically, **to enable MLX output a pickle in a format compatible with PyTorch's snapshot format** so that the existing viewer works out of the box. No new frontend required.
+I really like PyTorch's [memory snapshot visualization](https://pytorch.org/blog/understanding-gpu-memory-1/) where I can record allocation history, dump a pickle, and drop it into [docs.pytorch.org/memory_viz](https://docs.pytorch.org/memory_viz), and see how each allocation is tied back to the code line that made it. So I decided to build one for MLX. Specifically, **to enable MLX output a pickle in a format compatible with PyTorch's snapshot format** so that the existing viewer works out of the box. No new frontend required.
 
 <hr class="hr-top" /><hr />
 
@@ -133,7 +131,7 @@ So **no recording happens yet** at this point. By default, the `enabled` argumen
 
 #### 2. How trace entries are recorded
 
-All trace entries are captured as `TraceEntry` objects, created inside `record_trace()`, a private function on `DeviceCachingAllocator`. If you search for every `record_trace()` call site in `c10/cuda/CUDACachingAllocator.cpp`, you'll notice they're called in **allocation and deallocation paths**. The one exception is `snapshot()`, which records an entry purely as a marker of when the user takes a snapshot. **So whenever the user calls a PyTorch function that triggers an allocation or deallocation, `record_trace()` is invoked**.
+All trace entries are captured as `TraceEntry` objects, created inside `record_trace()`, a private function on `DeviceCachingAllocator`. If you search for every `record_trace()` call site in `c10/cuda/CUDACachingAllocator.cpp`, you'll notice they're called in **memory allocation and deallocation paths**. The one exception is `snapshot()`, which records an entry purely as a marker of when the user takes a snapshot. **So whenever the user calls a PyTorch function that triggers an allocation or deallocation, `record_trace()` is invoked**.
 
 `record_trace()` then does the following (with some details omitted):
 1. Return early if `record_history` is `false` and no trace trackers are registered (I won't cover trace trackers here.)
@@ -149,33 +147,42 @@ All trace entries are captured as `TraceEntry` objects, created inside `record_t
 
 As you may have expected, the diagram for `_dump_snapshot()` is very much aligned with `_record_memory_history()`. Once `THCPModule_memorySnapshot()` receives the output, it parses the output into a dictionary and passes it back to the Python side. If `_dump_snapshot()` is called, the dictionary snapshot is then dumped into a pickle file.
 
+Of the two outputs, `device_traces` and `segments`, **we'll focus only on `device_traces` in this post**.
+
 <hr class="hr-single" />
 
 #### 4. Capturing the context
 
-One component I consider essential is stack trace capture. Having the call chain that leads to each allocation/deallocation, particularly the Python frames, provides helpful context for debugging. *How does PyTorch capture this context*? In order to answer this question, I'll trace the code **from the output back to where it's captured**.
+One essential component is stack trace capture. Having the call chain that leads to each allocation/deallocation, particularly the Python frames, provides helpful context for debugging. *How does PyTorch capture this context*? In order to answer this question, I'll trace the code **from the output back to where it's captured**.
 
-**From a `TraceEntry`'s context to `{filename, line, name}`**
+**The list of `{filename, line, name}`s comes from `TraceEntry`s' context**
 
-The [docstring of `_snapshot()`](https://github.com/pytorch/pytorch/blob/e4bdcb097b91e69f2cd74789d7cc51703c617ce4/torch/cuda/memory.py#L1044) in `torch/cuda/memory.py` provides clear details of how the memory state is represented. The component we're interested in is the `Frame` TypedDict, containing `filename`, `line`, and `name` fields (plus optional FX debug fields, which I will omit in my explanation). Both `TraceEntry` and `Block` carry a `frames` field holding a list of these `Frame`s.
+The [docstring of `_snapshot()`](https://github.com/pytorch/pytorch/blob/e4bdcb097b91e69f2cd74789d7cc51703c617ce4/torch/cuda/memory.py#L1045-L1131) in `torch/cuda/memory.py` provides clear details of how the memory state is represented. The component we're interested in is the `Frame` TypedDict, containing `filename`, `line`, and `name` fields (plus optional FX debug fields, which I will omit in my explanation). Both `TraceEntry` and `Block` carry a `frames` field holding a list of these `Frame`s.
 
-In `THCPModule_memorySnapshot()`, focusing on `TraceEntry` specifically, we see in [`traceEntryToDict()`](https://github.com/pytorch/pytorch/blob/68b353e2d8b7879b819209055f5524d0e7a1e9d1/torch/csrc/cuda/Module.cpp#L902) that the context comes from the `context_` field held by `TraceEntry`. `getCapturedTracebackFromContext(te.context_)` returns a raw `CapturedTraceback*` (I'll talk more about `CapturedTraceback` later), which is appended to `to_gather_frames`. After all entries are processed, the whole batch of frames in `to_gather_frames` is [symbolized at once into filename, line, and name information by `py_symbolize()`](https://github.com/pytorch/pytorch/blob/68b353e2d8b7879b819209055f5524d0e7a1e9d1/torch/csrc/cuda/Module.cpp#L1034), and the results are written back into each entry's `frames` key.
+In `THCPModule_memorySnapshot()`, tracing how the snapshot's `trace_entries` is used, we see in [`traceEntryToDict()`](https://github.com/pytorch/pytorch/blob/68b353e2d8b7879b819209055f5524d0e7a1e9d1/torch/csrc/cuda/Module.cpp#L902) that the context comes from **the `context_` field held by `TraceEntry`**. `getCapturedTracebackFromContext(te.context_)` returns a raw `CapturedTraceback*` (I'll talk more about `CapturedTraceback` later), which is appended to `to_gather_frames`. After all entries are processed, the whole batch of frames in `to_gather_frames` is [symbolized at once into filename, line, and name information by `py_symbolize()`](https://github.com/pytorch/pytorch/blob/68b353e2d8b7879b819209055f5524d0e7a1e9d1/torch/csrc/cuda/Module.cpp#L1034), and the results are written back into each entry's `frames` key.
 
-**Where a `TraceEntry`'s context comes from**
+**How each `TraceEntry`'s context is created and passed to `record_trace()`**
 
-Recall that [`TraceEntry`s are created by `record_trace()`](https://github.com/pytorch/pytorch/blob/68b353e2d8b7879b819209055f5524d0e7a1e9d1/c10/cuda/CUDACachingAllocator.cpp#L4432). Tracing where its context argument comes from leads to `maybeGatherContext()` (one example [here](https://github.com/pytorch/pytorch/blob/68b353e2d8b7879b819209055f5524d0e7a1e9d1/c10/cuda/CUDACachingAllocator.cpp#L1724)). This function loads and invokes `context_recorder_`, which is the **context-recording callback function** installed when `recordHistory()` was called (within the `_record_memory_history()` call path mentioned in [point 1](1-torchcudamemory_record_memory_history-turning-onoff-memory-recording)), or returns nothing if recording is disabled, hence the `maybe`. `maybeGatherContext()` is called at most once per invocation by the allocator methods that initiate traceable events (e.g., `malloc`, `free`, `release_blocks`, `emptyCache`).
+Recall that [`TraceEntry`s are created by `record_trace()`](https://github.com/pytorch/pytorch/blob/68b353e2d8b7879b819209055f5524d0e7a1e9d1/c10/cuda/CUDACachingAllocator.cpp#L4432). Tracing where its context argument comes from leads to `maybeGatherContext()` (one example [here](https://github.com/pytorch/pytorch/blob/68b353e2d8b7879b819209055f5524d0e7a1e9d1/c10/cuda/CUDACachingAllocator.cpp#L1724)). This function loads and invokes `context_recorder_`, which is the **context-recording callback function** installed when `recordHistory()` was called (within the `_record_memory_history()` call path mentioned in [point 1](#1-torchcudamemory_record_memory_history-turning-onoff-memory-recording)), or returns nothing if recording is disabled, hence the `maybe`. `maybeGatherContext()` is called at most once per invocation by the allocator methods that initiate traceable events (e.g., `malloc`, `free`, `release_blocks`, `emptyCache`).
 
 So now we know when and where "context"s are created and used to create a `TraceEntry`. But how do we define a "context" to begin with?
 
 **What is a "context"?**
 
-*To be honest, this is probably the part where I struggled with the most. I hope I've understood and explained it correctly, and any feedback is always welcome.*
+*To be honest, this is probably one of the parts I struggled with the most. I hope I've understood and explained it correctly, and any feedback is always welcome.*
 
-As a member of `TraceEntry`, `context_` is a [shared pointer to `c10::GatheredContext`](https://github.com/pytorch/pytorch/blob/68b353e2d8b7879b819209055f5524d0e7a1e9d1/c10/core/CachingDeviceAllocator.h#L175). `GatheredContext` itself is [defined as an *empty* polymorphic base on the **allocator**'s side (`c10/core/Allocator.h`)](https://github.com/pytorch/pytorch/blob/68b353e2d8b7879b819209055f5524d0e7a1e9d1/c10/core/Allocator.h#L347). Its purpose is to be a type the allocator can access **without knowing what's inside** (which also means it's free from any potentially heavy dependencies).
+As a member of `TraceEntry`, `context_` is a [shared pointer to `c10::GatheredContext`](https://github.com/pytorch/pytorch/blob/68b353e2d8b7879b819209055f5524d0e7a1e9d1/c10/core/CachingDeviceAllocator.h#L175). `GatheredContext` itself is [defined as an *empty* polymorphic base (apart from a virtual destructor) on the **allocator**'s side (`c10/core/Allocator.h`)](https://github.com/pytorch/pytorch/blob/68b353e2d8b7879b819209055f5524d0e7a1e9d1/c10/core/Allocator.h#L347). Its purpose is to be a type the allocator can access **without knowing what's inside**, i.e., an *opaque* handler (which also means it's free from any potentially heavy dependencies).
+
+<!-- START OF DIV -->
+<div class="div-author-note">
+<h4>Author's Note</h4>
+<code>GatheredContext</code> being an opaque handler will be important <a href="#3-implement-traceback-capture">when we implement traceback capture</a> later. Just a heads-up!
+</div>
+<!-- END OF DIV -->
 
 I mentioned `CapturedTraceback*` very briefly earlier as the type returned by `getCapturedTracebackFromContext()`. `CapturedTraceback` [inherits `GatheredContext`](https://github.com/pytorch/pytorch/blob/68b353e2d8b7879b819209055f5524d0e7a1e9d1/torch/csrc/profiler/combined_traceback.h#L23) and lives on the **profiler**'s side (`torch/csrc/profiler/combined_traceback.h`). This is where we see the implementations we're looking for. Looking at the header, it holds three separate frame vectors: `frames_` (Python), `cpp_frames_`, and `script_frames_`, and its static `gather(python, script, cpp)` takes one flag per kind.
 
-Looking back at `c10::cuda::_record_memory_history()` in `torch/csrc/cuda/memory_snapshot.cpp` from [point 1](1-torchcudamemory_record_memory_history-turning-onoff-memory-recording), we see that the context-gathering callback `recorder` is set to either `gather` or `gather_with_cpp`, which [call `CapturedTraceback::gather()` with the appropriate arguments](https://github.com/pytorch/pytorch/blob/68b353e2d8b7879b819209055f5524d0e7a1e9d1/torch/csrc/cuda/memory_snapshot.cpp#L117). `recorder` is then passed to `c10::cuda::CUDACachingAllocator::recordHistory()`.
+Looking back at `c10::cuda::_record_memory_history()` in `torch/csrc/cuda/memory_snapshot.cpp` from [point 1](#1-torchcudamemory_record_memory_history-turning-onoff-memory-recording), we see that the context-gathering callback `recorder` is set to either `gather` or `gather_with_cpp`, which [call `CapturedTraceback::gather()` with the appropriate arguments](https://github.com/pytorch/pytorch/blob/68b353e2d8b7879b819209055f5524d0e7a1e9d1/torch/csrc/cuda/memory_snapshot.cpp#L117). `recorder` is then passed to `c10::cuda::CUDACachingAllocator::recordHistory()`.
 
 <!-- START OF DIV -->
 <div class="div-interested">
@@ -228,13 +235,15 @@ Let's start with `python_support_`, a linked list of unwinders that is a static 
 
 When [`CapturedTraceback::gather()`](https://github.com/pytorch/pytorch/blob/68b353e2d8b7879b819209055f5524d0e7a1e9d1/torch/csrc/profiler/combined_traceback.cpp#L8) is called with `python = True`, it walks the unwinder linked list until an unwinder can and does gather Python frames. For each, it first checks [`PythonTraceback::canGather()`](https://github.com/pytorch/pytorch/blob/68b353e2d8b7879b819209055f5524d0e7a1e9d1/torch/csrc/profiler/python/combined_traceback.cpp#L27) (GIL safety on the current thread). If safe, it calls [`PythonTraceback::gather()`](https://github.com/pytorch/pytorch/blob/68b353e2d8b7879b819209055f5524d0e7a1e9d1/torch/csrc/profiler/python/combined_traceback.cpp#L44), which gets the current frame via `PyEval_GetFrame()` and walks up the stack (`PyFrame_GetBack()`), storing `(code, lasti)` per frame. Once frames are captured, the loop stops and does not visit remaining unwinders (if any).
 
+More on how Python frames are handled in PyTorch will be discussed [when we implement traceback capture](#3-implement-traceback-capture).
+
 <hr class="hr-top" /><hr />
 
 # Plan 2: Understand MLX's side
 
 *Note: the MLX version described here is `v0.32.1` with head commit `255f953f`. Some details that are deemed irrelevant are omitted.*
 
-One main thing I learned from PyTorch's implementation is this: at each allocation/deallocation event in the allocator, capture the stack *at that moment* and attach it to the trace entry as context.
+One main thing I learned from PyTorch's implementation is this: at each memory allocation/deallocation event in the allocator, capture the stack *at that moment* and attach it to the trace entry as context.
 
 In MLX, we can create a trace entry in the allocation/deallocation path in pretty much the same way, but we *can't capture the traceback there*. MLX is lazy, so arrays are only materialized when needed. By the time the allocator actually runs, the Python code that constructed the array has long since returned, so every traceback would point at the `eval()` or whatever else that triggers materialization rather than at the code responsible for the allocation.
 
@@ -272,7 +281,7 @@ How is the graph constructed? What happens when we invoke each of the line in th
 
 #### The `array` class (and its nested `ArrayDesc` struct)
 
-As mentioned in the docstring, "an array is really a node in the graph". Looking at its private member, it actually only holds [a shared pointer to `ArrayDesc` object, `array_desc_`](https://github.com/ml-explore/mlx/blob/255f953f99c3403df19fa4d92462143139c3dfff/mlx/array.h#L533) apart from its `init()` function. An `array` is therefore just one pointer wide, which is what makes passing it around by value cheap. Most of its public functions are thin accessors that forward to **the data contained within `array_desc_`**.
+As mentioned in the docstring, "an array is really a node in the graph". Looking at its private member, it actually only holds [a shared pointer to `ArrayDesc` object, `array_desc_`](https://github.com/ml-explore/mlx/blob/255f953f99c3403df19fa4d92462143139c3dfff/mlx/array.h#L533). An `array` is therefore just one pointer wide, which is what makes passing it around by value cheap. Most of its public functions are thin accessors that forward to **the data contained within `array_desc_`**.
 
 Looking at the [`ArrayDesc` struct definition](https://github.com/ml-explore/mlx/blob/255f953f99c3403df19fa4d92462143139c3dfff/mlx/array.h#L478), we see the following information:
 - **The metadata**: shape, strides, size, dtype, offset, data_size (how many elements of the buffer it actually accesses), flags (contiguity information).
@@ -288,7 +297,7 @@ Looking at the [`ArrayDesc` struct definition](https://github.com/ml-explore/mlx
 - **The siblings**: the co-outputs of a multi-output operation, along with `position`, this array's index in that output list.
 
 There are multiple possible levels of sharing here:
-1. Multiple `array` handles sharing one `ArrayDesc` are **the same array**. Also notice that `id()` of the array returns the address of that shared `ArrayDesc` object, so these handles all report the same `id()`.t()), so those handles all report the same id().
+1. Multiple `array` handles sharing one `ArrayDesc` are **the same array**. Also notice that `id()` of the array returns the address of that shared `ArrayDesc` object, so these handles all report the same `id()`.
 2. Multiple `ArrayDesc`s sharing one `Data` are different **views** onto the same memory, each with its own shape, strides, and offset.
 3. Multiple `ArrayDesc`s sharing one `Primitive` indicate the co-outputs of the same multi-output operation
 
@@ -303,7 +312,7 @@ a = mx.array([1, 2, 3, 4], dtype=mx.float32)
 b = mx.array([5, 6, 7, 8], dtype=mx.float32)
 ```
 
-Each line above [calls `create_array()`](https://github.com/ml-explore/mlx/blob/255f953f99c3403df19fa4d92462143139c3dfff/python/src/array.cpp#L310), which is defined in `python/src/convert.cpp`. Tracing it through a few more layers eventually reaches [`return mx::array(vals.begin(), shape, dtype);`](https://github.com/ml-explore/mlx/blob/255f953f99c3403df19fa4d92462143139c3dfff/python/src/convert.cpp#L613). It calls [one of `array`'s constructor](https://github.com/ml-explore/mlx/blob/255f953f99c3403df19fa4d92462143139c3dfff/mlx/array.h#L542-L549), which initializes `array_desc_` via `ArrayDesc`'s [constructor](https://github.com/ml-explore/mlx/blob/255f953f99c3403df19fa4d92462143139c3dfff/mlx/array.cpp#L259-L262) and its `init()` function. Notice that these arrays are immediately `available`, i.e., the data exists right away and no evaluation is needed.
+Each line above [calls `create_array()`](https://github.com/ml-explore/mlx/blob/255f953f99c3403df19fa4d92462143139c3dfff/python/src/array.cpp#L310), which is defined in `python/src/convert.cpp`. Tracing it through a few more layers eventually reaches [`return mx::array(vals.begin(), shape, dtype);`](https://github.com/ml-explore/mlx/blob/255f953f99c3403df19fa4d92462143139c3dfff/python/src/convert.cpp#L613). It calls [one of `array`'s constructor](https://github.com/ml-explore/mlx/blob/255f953f99c3403df19fa4d92462143139c3dfff/mlx/array.h#L542-L549), which initializes `array_desc_` via `ArrayDesc`'s [constructor](https://github.com/ml-explore/mlx/blob/255f953f99c3403df19fa4d92462143139c3dfff/mlx/array.cpp#L259-L262) and its `init()` function. Notice that these *leaf* arrays are immediately `available`, i.e., **the data is materialized right away and no evaluation is needed**.
 
 `c = a + b`, on the other hand, invokes `a.__add__(b)`, which [calls `mx::add(a, b)`](https://github.com/ml-explore/mlx/blob/255f953f99c3403df19fa4d92462143139c3dfff/python/src/array.cpp#L547-L556) that is defined in [`mlx/ops.cpp`](https://github.com/ml-explore/mlx/blob/255f953f99c3403df19fa4d92462143139c3dfff/mlx/ops.cpp#L2947-L2954). It in turn calls [an `array`'s constructor](https://github.com/ml-explore/mlx/blob/255f953f99c3403df19fa4d92462143139c3dfff/mlx/array.cpp#L19-L40), [an `ArrayDesc`'s constructor](https://github.com/ml-explore/mlx/blob/255f953f99c3403df19fa4d92462143139c3dfff/mlx/array.cpp#L264-L275), and invokes ArrayDesc's `init()`.
 
@@ -371,7 +380,7 @@ Here are the implementation steps. My main goal at this point is a working proto
 
 ### 1. Enable recording memory events.
 
-This step entails the following substeps:
+This step is fairly straightforward and it entails the following substeps:
 
    - [Backend] Implement a recording function, along with a class representing a memory event, and call it from the allocator's allocation and deallocation paths.
    - [Backend] Ensure the memory event class contains a flag to indicate whether the recording is enabled or not.
@@ -381,6 +390,8 @@ This step entails the following substeps:
 <hr class="hr-single" />
 
 ### 2. Capture the primitive name associated with each event.
+
+Since we're not capturing C++ stacks, the primitive names carry most of the signal about where an allocation came from.
 
 To record which primitive an allocation/deallocation belongs to, we need to get the primitive's name from `array` down to the event recording function. Recall from the [`eval` description section](when-eval-is-triggered) that primitives are invoked in [these lines](https://github.com/ml-explore/mlx/blob/255f953f99c3403df19fa4d92462143139c3dfff/mlx/transforms.cpp#L264-L268) where `arr` is passed to either `gpu::eval()` or `cpu::eval()`.
 
@@ -418,12 +429,12 @@ Possibly the most challenging part of the implementation for me. I relied heavil
 
 #### Challenges
 
-In both PyTorch and MLX, there is a Python layer and a C++ layer. The allocator runs in pure C++ and handles allocations, deallocations, and trace recording. Meanwhile, we want to capture Python stacks and attach the captured `PyObject`s to the recorded trace entries. Here is the catch: the allocator cannot include Python headers (i.e., cannot use `PyObject`). PyTorch solves this with the three layers illustrated in Figure 6 below.
+In both PyTorch and MLX, there is a Python layer and a C++ layer. The allocator runs in pure C++ and handles allocations, deallocations, and trace recording. Meanwhile, we want to capture Python stacks and attach the captured `PyObject`s to the recorded trace entries. Here is the catch: *the allocator cannot include Python headers* (i.e., cannot use `PyObject`). PyTorch solves this with the three layers illustrated in Figure 6 below.
 
 ![The layering design in PyTorch](/assets/images/2026-07-30-mlx_memory_viz/plan3_pytorch.png)
 <p style="text-align: center;"><i>Figure 6. The layering design in PyTorch.</i></p>
 
-1. **Layer 1**: The allocator sees only an opaque `GatheredContext` and invokes `context_recorder_` (which we discussed earlier) to produce one.
+1. **Layer 1**: The allocator sees only an *opaque* `GatheredContext` and invokes `context_recorder_` (which we discussed earlier) to produce one.
 2. **Layer 2**: torch C++ sees the `PyFrame` type, which stores the frame's code object as a `void*` rather than a `PyObject*`. A `void*` can be stored, moved, and compared, but never dereferenced, meaning, this layer cannot INCREF, DECREF, or read a filename. Anything that needs to *interpret* the pointer goes through a virtual interface that Layer 3 registers at import time.
 3. **Layer 3**: The Python binding file, which implements all the Python-specific operations, from walking the frame stack, resolving frames to filenames and line numbers, to releasing references.
 
@@ -443,16 +454,16 @@ To mitigate this problem, instead of passing the `PyObject*` (in the form of `vo
 
 This entails the following steps:
 
-1. In `mlx/traceback.h|cpp`, implement the hook mechanism: `set_traceback_tracking()` to enable tracking, `set_traceback_capture_func()` to install the capture hook, and `capture_traceback()` to invoke the hook. `capture_traceback()` returns a `TracebackId`, and the core only transports it.
+1. In `mlx/traceback.h|cpp`, implement the hook mechanism: `set_traceback_tracking()` to enable tracking, `set_traceback_capture_func()` to install the capture hook (which is invoked by `install_traceback_capture()`), and `capture_traceback()` to invoke the hook. `capture_traceback()` returns a `TracebackId`, and the core only transports it.
 
 2. Add a new `ArrayDesc` field `traceback` for storing the traceback ID.
 
 3. Capture the traceback when the `ArrayDesc` is created (we discussed earlier how the `init()` function can be a reliable capture point): 
   ```c++
-  void array::ArrayDesc::init() {
-    ...
-    traceback = detail::capture_traceback();
-  }
+void array::ArrayDesc::init() {
+  ...
+  traceback = detail::capture_traceback();
+}
   ```
 
 4. Add the traceback ID to `OpInfo`, so the thread-local `current_op` can carry it from the eval loop to the allocator.
@@ -463,17 +474,17 @@ This entails the following steps:
 
 7. Call `set_traceback_tracking(enabled)` in `record_memory_event()` (next to the existing `set_op_tracking(enabled)`), and attach the traceback in `maybe_record_events()`:
   ```c++
-  if (MemoryEvent::is_alloc(action)) {
-    event.primitive_name = detail::current_op.primitive_name;
-    // Add the lines below.
-    event.traceback = detail::current_op.traceback != detail::no_traceback
-        ? detail::current_op.traceback
-        : detail::capture_traceback();
-  }
+if (MemoryEvent::is_alloc(action)) {
+  event.primitive_name = detail::current_op.primitive_name;
+  // Add the lines below.
+  event.traceback = detail::current_op.traceback != detail::no_traceback
+      ? detail::current_op.traceback
+      : detail::capture_traceback();
+}
   ```
   The fallback in the last line exists for leaf arrays. Leaf arrays allocate eagerly at construction without `eval()`, so no `OpContext` ever runs and `current_op` carries no ID. Consequently, the ID sitting in `ArrayDesc` is unreachable from the allocator, whose interface is just `malloc(size)`. But leaf construction happens on the Python thread with the GIL held, so the allocator can simply capture directly. This is safe because the capture function *never attempts* to acquire GIL; it only checks if GIL is held. In other use cases (the eval path), the check fails and the fallback harmlessly returns `no_traceback` (though `current_op` already has the ID anyway).
 
-8. Implement the capture function itself in `python/src/traceback.h|cpp`, along with the interning table. For deduplication, the table hashes each captured stack. I picked the Fowler–Noll–Vo hash since the choice isn't critical (the hash only acts as a prefilter here).
+8. Implement the capture function itself in `python/src/traceback.h|cpp`, along with the interning table. For deduplication, the table hashes each captured stack. I picked the Fowler–Noll–Vo hash for its simplicity and for how easily it folds frame by frame into a running hash.
 
 9. Also in `python/src/traceback.h|cpp`, implement `resolve_traceback(TracebackId id)`, which turns an ID back into a readable stack: a list of `(filename, function name, line number)` tuples, ordered outermost frame first to match Python's own traceback convention. This is called from the `get_memory_events()` binding.
 
@@ -481,7 +492,7 @@ This entails the following steps:
 
 ### 4. Format the output to match PyTorch's snapshot format.
 
-PyTorch's snapshot dictionary [contains the following fields](https://github.com/pytorch/pytorch/blob/e4bdcb097b91e69f2cd74789d7cc51703c617ce4/torch/csrc/cuda/Module.cpp#L1027-L1032): `segments`, `device_traces`, `allocator_settings`, `external_annotations`, `host_segments`, and `host_traces`. For our first prototype, we'll only implement `device_traces` and leave `segments` as an empty list.
+PyTorch's snapshot dictionary [contains the following fields](https://github.com/pytorch/pytorch/blob/e4bdcb097b91e69f2cd74789d7cc51703c617ce4/torch/csrc/cuda/Module.cpp#L1027-L1032): `segments`, `device_traces`, `allocator_settings`, `external_annotations`, `host_segments`, and `host_traces`. For our first prototype, we'll only include `device_traces` and `segments`. Specifically, we'll implement `device_traces` and leave `segments` as an empty list.
 
 Since we already have `mx.get_memory_events()`, we just need a function that reformats its output into a form the memory viz web app can load. Note that we want to handle two different timelines:
 
