@@ -15,7 +15,7 @@ The post is organized into the following sections:
 - [The plan](#the-plan)
 - [Plan 1: Understand PyTorch's side](#plan-1-understand-pytorchs-side)
    - [What happens behind the scene?](#what-happens-behind-the-scene)
-      - [1. `torch.cuda.memory._record_memory_history(): turning on/off memory recording](#1-torchcudamemory_record_memory_history-turning-onoff-memory-recording)
+      - [1. `torch.cuda.memory._record_memory_history(): turning on/off memory event recording](#1-torchcudamemory_record_memory_history-turning-onoff-memory-event-recording)
       - [2. How trace entries are recorded](#2-how-trace-entries-are-recorded)
       - [3. `torch.cuda.memory._dump_snapshot("out.pickle")`: taking a snapshot](#3-torchcudamemory_dump_snapshotoutpickle-taking-a-snapshot)
       - [4. Capturing the context](#4-capturing-the-context)
@@ -29,8 +29,8 @@ The post is organized into the following sections:
   - [3. Implement traceback capture.](#3-implement-traceback-capture)
   - [4. Format the output to match PyTorch's snapshot format.](#4-format-the-output-to-match-pytorchs-snapshot-format)
 - [Benchmarks](#benchmarks)
-  - [1. Cost of having the functionality implemented](#1-cost-of-having-the-functionality-implemented)
-  - [2. Performance of stack capture and event creation](#2-performance-of-stack-capture-and-event-creation)
+  - [1. Estimating the cost of having the functionality implemented](#1-estimating-the-cost-of-having-the-functionality-implemented)
+  - [2. Assessing the performance of stack capture and event creation](#2-assessing-the-performance-of-stack-capture-and-event-creation)
 - [Limitations and potential improvements](#limitations-and-potential-improvements)
 - [Summary](#summary)
 - [Appendix](#appendix)
@@ -144,14 +144,14 @@ torch.cuda.memory._record_memory_history(enabled=None)
 ### What happens behind the scene?
 
 I'll divide this section into 4 parts:
-1. [`torch.cuda.memory._record_memory_history(): turning on/off memory recording](#1-torchcudamemory_record_memory_history-turning-onoff-memory-recording)
+1. [`torch.cuda.memory._record_memory_history(): turning on/off memory event recording](#1-torchcudamemory_record_memory_history-turning-onoff-memory-recording)
 2. [How trace entries are recorded](#2-how-trace-entries-are-recorded)
 3. [`torch.cuda.memory._dump_snapshot("out.pickle")`: taking a snapshot](#3-torchcudamemory_dump_snapshotoutpickle-taking-a-snapshot)
 4. [Capturing the context](#4-capturing-the-context)
 
 <hr class="hr-single" />
 
-#### 1. `torch.cuda.memory._record_memory_history()`: turning on/off memory recording
+#### 1. `torch.cuda.memory._record_memory_history()`: turning on/off memory event recording
 
 ![_record_memory_history() function calls](/assets/images/2026-08-28-mlx_memory_viz/plan1_pytorch_code1.png)
 <p style="text-align: center;"><i>Figure 1. The call path from <code>torch.cuda.memory._record_memory_history()</code> down to the per-device allocator. Note that some details have been omitted for simplicity.</i></p>
@@ -571,7 +571,7 @@ Since I don't currently capture C++ stacks, the primitive name carries most of t
 
 # Benchmarks
 
-To assess the performance of the memory recording functionality, I ran two kinds of benchmarks on an M3 MacBook Air (16 GB unified memory, macOS Tahoe 26.5.2):
+To assess the performance of the memory event recording functionality, I ran two kinds of benchmarks on an M3 MacBook Air (16 GB unified memory, macOS Tahoe 26.5.2):
 
 1. [Estimating the cost of having the functionality implemented](#1-estimating-the-cost-of-having-the-functionality-implemented), i.e., comparing no functionality vs. with functionality (recording off)
 2. [Assessing the performance of stack capture and event creation](#2-assessing-the-performance-of-stack-capture-and-event-creation)
@@ -642,19 +642,19 @@ def benchmark_add():
 Notice the tiny array size. Since event and array (relevant for stack capture) counts are independent from array size, shrinking the size would help maximizing the overhead's visibility by collapsing the per-op baseline. Each op runs 1000 times per batch across 50 batches. Some warmup steps are also run beforehand. Additionally, the benchmark was run on the CPU since the scheduling and synchronization cost in the GPU may end up swamping the effect being measured.
 
 ![Benchmark 1](/assets/images/2026-08-28-mlx_memory_viz/benchmark_1.png)
-<p style="text-align: center;"><i>Figure 8. Benchmark 1 results. <code>no memviz</code> represents the original MLX code (v0.32.1) and <code>memviz disabled</code> represents MLX v0.32.1 + memory recording implemented but disabled. The error bars represent 95% confidence interval.</i></p>
+<p style="text-align: center;"><i>Figure 8. Benchmark 1 results. <code>no memviz</code> represents the original MLX code (v0.32.1) and <code>memviz disabled</code> represents MLX v0.32.1 + memory event recording implemented but disabled. The error bars represent 95% confidence interval.</i></p>
 
 In the plot above, we see that the `memviz disabled` bars are not consistently higher than the `no memviz` bars. The differences between adjacent bars are also so tiny that they could be mainly attributed to noise.
 
 You might also notice that the `full` operation takes longer than the `add` operation. This is because the `full` operation actually constructs two arrays/nodes in the computation graph: one from `broadcast`, to reshape `val` from `()` to `(10, 10)`, and the other from the `full` operation itself. Meanwhile, `add` only constructs one node. This detail will become more important in the next benchmark.
 
-In summary, according to this benchmark result, **adding the memory recording implementation does not seem to introduce any noticeable extra cost**.
+In summary, according to this benchmark result, **adding the memory event recording implementation does not seem to introduce any noticeable extra cost**.
 
 <hr class="hr-single" />
 
 ### 2. Assessing the performance of stack capture and event creation
 
-When memory recording is enabled, recall that the Python stack is captured during graph construction and the memory events are captured when eval is triggered. Specifically,
+When memory event recording is enabled, recall that the Python stack is captured during graph construction and the memory events are captured when eval is triggered. Specifically,
 
 - For each node creation in the graph:
   - Invokes `capture_traceback()`, which captures the Python stacks with a maximum depth of 32 frames
@@ -664,7 +664,7 @@ When memory recording is enabled, recall that the Python stack is captured durin
   - Atomic loads `op_tracking_enabled` and creates (and destroys) `OpContext`, which retrieves each array's primitive name and traceback ID during creation
   - Invokes a complete `maybe_record_events()` in every allocation and deallocation
 
-In this benchmark, we hope to measure the cost of 1) each stack capture (including the stack interning) and 2) the event creation. To do so, we run the same benchmark functions above with memory recording on and off, once with no eval invocation and once with eval. The recursive function call is implemented to reach 32 frames, which is the maximum number of walks during stack interning. The results can be found in the table below.
+In this benchmark, we hope to measure the cost of 1) each stack capture (including the stack interning) and 2) the event creation. To do so, we run the same benchmark functions above with memory event recording on and off, once with no eval invocation and once with eval. The recursive function call is implemented to reach 32 frames, which is the maximum number of walks during stack interning. The results can be found in the table below.
 
 **Durations [95% CI intervals] of `full` operations, along with computed stack-capture and event-creation costs (all in μsec)**, 50 × 1,000 repetitions
 
