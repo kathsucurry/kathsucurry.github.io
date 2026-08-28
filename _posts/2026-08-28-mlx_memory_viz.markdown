@@ -1,16 +1,16 @@
 ---
 layout: post
-title:  "Building a Memory Profiler for MLX"
+title:  "Bringing PyTorch's Memory Visualizer to MLX"
 date:   2026-08-28
 categories: mlx
 katex: true
 ---
 
-The main goal of this write-up is mostly to help myself understand what I'm actually doing, as much as I can. If you have any input or feedback, I'd love to hear it! 
+In this post, I will walk through how I implemented a *preliminary* memory event recorder in MLX where the recorded events can be dumped into a pickle file compatible with PyTorch's memory viz web app. The main goal of this write-up is mostly to help myself understand what I'm actually doing, as much as I can. If you have any input or feedback, I'd love to hear it! 
 
 The post is organized into the following sections:
 
-- [How to use](#how-to-use)
+- [Quick How-To](#quick-how-to)
 - [Motivation](#motivation)
 - [The plan](#the-plan)
 - [Plan 1: Understand PyTorch's side](#plan-1-understand-pytorchs-side)
@@ -39,9 +39,9 @@ My implementation can be found [here](https://github.com/kathsucurry/mlx/tree/v0
 
 <hr class="hr-top" /><hr />
 
-# How to use
+# Quick How-To
 
-Use the MLX version [here](https://github.com/kathsucurry/mlx/tree/v0.32.1-memory-viz).
+To enable memory recording, use the MLX version [here](https://github.com/kathsucurry/mlx/tree/v0.32.1-memory-viz) and run the following functions:
 
 ```python
 import mlx.core as mx
@@ -68,7 +68,7 @@ mx.record_memory_events(enabled=False)
 
 # Motivation
 
-I ran into a small problem while learning [MLX](https://github.com/ml-explore/mlx): I couldn't find a memory profiler I liked... Maybe I just missed some obvious existing tools out there, but here are two tools I found.
+When learning [MLX](https://github.com/ml-explore/mlx), I couldn't find a memory profiler I liked. Maybe I just missed some obvious existing tools out there, but here are two tools I found.
 
 <div style="padding-left: 20px;">
 
@@ -97,17 +97,17 @@ Then open the <code>.gputrace</code> in Xcode. This is a powerful tool, but to m
 
 </div>
 
-I really like PyTorch's [memory snapshot visualization](https://pytorch.org/blog/understanding-gpu-memory-1/) where I can record allocation history, dump a pickle, and drop it into [docs.pytorch.org/memory_viz](https://docs.pytorch.org/memory_viz), and see how each allocation is tied back to the code line that made it. So I decided to build one for MLX. Specifically, **to enable MLX output a pickle in a format compatible with PyTorch's snapshot format** so that the existing viewer works out of the box. No new frontend required.
+I really like PyTorch's [memory snapshot visualization](https://pytorch.org/blog/understanding-gpu-memory-1/) where I can record allocation history, dump a pickle, drop it into [docs.pytorch.org/memory_viz](https://docs.pytorch.org/memory_viz), and see how each allocation is tied back to the code line that made it. So I decided to build one for MLX. Specifically, **to enable MLX output a pickle in a format compatible with PyTorch's snapshot format** so that the existing viewer works out of the box. No new frontend required.
 
 <hr class="hr-top" /><hr />
 
 # The plan
 
 1. **Understand PyTorch's side.** How are the memory events recorded? What ends up in the output pickle file?
-2. **Understand MLX's side.** Where does MLX allocate? How does lazy evaluation influence the implementation?
+2. **Understand MLX's side.** Where does MLX allocate memory? How would lazy evaluation influence the implementation?
 3. **Bridge the two.** Output MLX allocation events in PyTorch's snapshot schema.
 
-I'm new to allocator internals and still learning C++, so I did get assistance from Claude Code, mostly for navigating through unfamiliar codebases, for the C++ I couldn't yet write unassisted, for correctness verification, and for getting suggestions for relevant readings.
+I'm new to allocator internals and still learning C++, so *I did get assistance from Claude Code*, mostly for navigating through unfamiliar codebases, for the C++ I couldn't yet write unassisted, for correctness verification, and for getting suggestions for relevant readings.
 
 <hr class="hr-top" /><hr />
 
@@ -205,7 +205,7 @@ So now we know when and where "context"s are created and used to create a `Trace
 
 **What is a "context"?**
 
-*To be honest, this is probably one of the parts I struggled with the most. I hope I've understood and explained it correctly, and any feedback is always welcome.*
+*This is one of the parts I struggled with the most. I hope I've understood and explained it correctly, and any feedback is always welcome.*
 
 As a member of `TraceEntry`, `context_` is a [shared pointer to `c10::GatheredContext`](https://github.com/pytorch/pytorch/blob/68b353e2d8b7879b819209055f5524d0e7a1e9d1/c10/core/CachingDeviceAllocator.h#L175). `GatheredContext` itself is [defined as an *empty* polymorphic base (apart from a virtual destructor) on the **allocator**'s side (`c10/core/Allocator.h`)](https://github.com/pytorch/pytorch/blob/68b353e2d8b7879b819209055f5524d0e7a1e9d1/c10/core/Allocator.h#L347). Its purpose is to be a type the allocator can access **without knowing what's inside**, i.e., an *opaque* handler (which also means it's free from any potentially heavy dependencies).
 
@@ -269,25 +269,25 @@ Let's start with `python_support_`, a linked list of unwinders that is a static 
 ![How python_support_ is updated](/assets/images/2026-08-28-mlx_memory_viz/plan1_pytorch_code3.png)
 <p style="text-align: center;"><i>Figure 3. How invoking `import torch` leads to updating <code>python_support_</code>.</i></p>
 
-When [`CapturedTraceback::gather()`](https://github.com/pytorch/pytorch/blob/68b353e2d8b7879b819209055f5524d0e7a1e9d1/torch/csrc/profiler/combined_traceback.cpp#L8) is called with `python = True`, it walks the unwinder linked list until an unwinder can and does gather Python frames. For each, it first checks [`PythonTraceback::canGather()`](https://github.com/pytorch/pytorch/blob/68b353e2d8b7879b819209055f5524d0e7a1e9d1/torch/csrc/profiler/python/combined_traceback.cpp#L27) (GIL safety on the current thread). If safe, it calls [`PythonTraceback::gather()`](https://github.com/pytorch/pytorch/blob/68b353e2d8b7879b819209055f5524d0e7a1e9d1/torch/csrc/profiler/python/combined_traceback.cpp#L44), which gets the current frame via `PyEval_GetFrame()` and walks up the stack (`PyFrame_GetBack()`), storing `(code, lasti)` per frame. Once frames are captured, the loop stops and does not visit remaining unwinders (if any).
+When [`CapturedTraceback::gather()`](https://github.com/pytorch/pytorch/blob/68b353e2d8b7879b819209055f5524d0e7a1e9d1/torch/csrc/profiler/combined_traceback.cpp#L8) is called with `python = True`, it walks the unwinder linked list until an unwinder can and does gather Python frames. For each, it first checks [`PythonTraceback::canGather()`](https://github.com/pytorch/pytorch/blob/68b353e2d8b7879b819209055f5524d0e7a1e9d1/torch/csrc/profiler/python/combined_traceback.cpp#L27) (i.e., GIL safety on the current thread). If safe, it calls [`PythonTraceback::gather()`](https://github.com/pytorch/pytorch/blob/68b353e2d8b7879b819209055f5524d0e7a1e9d1/torch/csrc/profiler/python/combined_traceback.cpp#L44), which gets the current frame via `PyEval_GetFrame()` and walks up the stack (`PyFrame_GetBack()`), storing `(code, lasti)` per frame. Once frames are captured, the loop stops and does not visit remaining unwinders (if any).
 
-More on how Python frames are handled in PyTorch will be discussed [when we implement traceback capture](#3-implement-traceback-capture).
+I'll describe how Python frames are handled in PyTorch a bit more [when we implement traceback capture](#3-implement-traceback-capture).
 
 <hr class="hr-top" /><hr />
 
 # Plan 2: Understand MLX's side
 
-*Note: the MLX version described here is `v0.32.1` with head commit `255f953f`. Some details that are deemed irrelevant are omitted.*
+*Note: the MLX version described here is based on `v0.32.1`, at head commit `255f953f`. Some details that are deemed irrelevant are omitted.*
 
 One main thing I learned from PyTorch's implementation is this: at each memory allocation/deallocation event in the allocator, capture the stack *at that moment* and attach it to the trace entry as context.
 
-In MLX, we can create a trace entry in the allocation/deallocation path in pretty much the same way, but we *can't capture the traceback there*. MLX is lazy, so arrays are only materialized when needed. By the time the allocator actually runs, the Python code that constructed the array has long since returned, so every traceback would point at the `eval()` or whatever else that triggers materialization rather than at the code responsible for the allocation.
+In MLX, we can create a trace entry in the allocation/deallocation path in pretty much the same way, but we *can't capture the traceback there*. MLX is lazy, so arrays are only materialized when needed. By the time the allocator actually runs, the Python code that constructed the array has long since returned, so every traceback would point at the `eval()` line or whatever else that triggers materialization rather than at the code responsible for the allocation.
 
 Before diving into how to resolve this difference, let's look at the components of MLX that may be relevant for our solution:
 
 - [The allocator](#the-allocator)
 - [Computation graph construction](#computation-graph-construction)
-- [When `eval` is triggered](#when-eval-is-triggered)
+- [What happens when `eval` is triggered](#what-happens-when-eval-is-triggered)
 
 I'll only cover the Metal-backend implementation here for simplicity.
 
@@ -304,16 +304,31 @@ You might be wondering why there seem to be two sets of allocation and deallocat
 - `malloc` and `free` handle buffers that MLX allocates and owns. `free` prefers to recycle a buffer into the cache when possible, so `malloc` can reuse it later.
 - `make_buffer` and `release` handle buffers that wrap external memory or foreign raw pointers (e.g., NumPy arrays) *without copying*. Since MLX doesn't own that memory, `release` tears down the wrapper and never recycles it.
 
+<!-- START OF DIV -->
+<div class="div-interested">
+<h4>If You're Curious...</h4>
+What does "recycling a buffer into the cache" means? It's part of what a <b>caching allocator</b> does (which is how MLX implements its allocator, and how PyTorch implements its CUDA allocator as well).
+<br /><br />
+Allocating and deallocating GPU memory directly is expensive and slow. To avoid this overhead, the caching allocator keeps freed blocks in the cache instead of returning them directly to the GPU. Then, when a new buffer needs to be allocated, the allocator checks whether the cache has any appropriately sized block to use. 
+<br /><br />
+This is why we have the terms <i>active memory</i> and <i>reserved memory</i>. Active memory is the amount of memory currently in use by live arrays (i.e., memory that hasn't been freed yet), whereas reserved memory is the total memory held by the allocator, including active memory and cached (freed but retained) blocks.
+</div>
+<!-- END OF DIV -->
+
 <hr class="hr-single" />
 
 ### Computation graph construction
 
-A computation graph is a directed acyclic graph describing how a result gets computed. Each node is an array, and an edge from one array to another means the second was computed from the first (as in, the first is the input to the operation that produces the second array). Below is a computation graph example (produced using `mx.export_to_dot()` **before** running any `mx.eval()` implemented in `mlx/graph_utils.cpp`) along with the computation code.
+To have the context point to the right Python line (instead of the line that triggers the eval), our best bet is **to place the stack capture somewhere during computation graph construction**. So this section aims to identify exactly where.
+
+A computation graph is a directed acyclic graph describing how a result gets computed. **Each node is an `array` object**, and an edge from one array to another means the second was computed from the first (as in, the first is the input to the operation that produces the second array). Below is a computation graph example (produced using `mx.export_to_dot()` **before** running any `mx.eval()` implemented in `mlx/graph_utils.cpp`) along with the computation code.
 
 ![A computation graph example](/assets/images/2026-08-28-mlx_memory_viz/plan2_mlx_code2.png)
 <p style="text-align: center;"><i>Figure 5. A computation graph example.</i></p>
 
 How is the graph constructed? What happens when we invoke each of the line in the example code above? To answer the questions, we'll start by delving into the [class `array`](https://github.com/ml-explore/mlx/blob/255f953f99c3403df19fa4d92462143139c3dfff/mlx/array.h#L26).
+
+<br />
 
 #### The `array` class (and its nested `ArrayDesc` struct)
 
@@ -339,6 +354,8 @@ There are multiple possible levels of sharing here:
 
 I will show examples of each in the section below.
 
+<br />
+
 #### What happens when we run each line in the Fig. 5 example?
 
 Now that we know what `array` is, we can look into what the lines in the example code actually do. Let's start with the following lines.
@@ -348,21 +365,25 @@ a = mx.array([1, 2, 3, 4], dtype=mx.float32)
 b = mx.array([5, 6, 7, 8], dtype=mx.float32)
 ```
 
-Each line above [calls `create_array()`](https://github.com/ml-explore/mlx/blob/255f953f99c3403df19fa4d92462143139c3dfff/python/src/array.cpp#L310), which is defined in `python/src/convert.cpp`. Tracing it through a few more layers eventually reaches [`return mx::array(vals.begin(), shape, dtype);`](https://github.com/ml-explore/mlx/blob/255f953f99c3403df19fa4d92462143139c3dfff/python/src/convert.cpp#L613). It calls [one of `array`'s constructor](https://github.com/ml-explore/mlx/blob/255f953f99c3403df19fa4d92462143139c3dfff/mlx/array.h#L542-L549), which initializes `array_desc_` via `ArrayDesc`'s [constructor](https://github.com/ml-explore/mlx/blob/255f953f99c3403df19fa4d92462143139c3dfff/mlx/array.cpp#L259-L262) and its `init()` function. Notice that these *leaf* arrays are immediately `available`, i.e., **the data is materialized right away and no evaluation is needed**.
+Each line above [calls `create_array()`](https://github.com/ml-explore/mlx/blob/255f953f99c3403df19fa4d92462143139c3dfff/python/src/array.cpp#L310), which is defined in `python/src/convert.cpp`. Tracing it through a few more layers eventually reaches [`return mx::array(vals.begin(), shape, dtype);`](https://github.com/ml-explore/mlx/blob/255f953f99c3403df19fa4d92462143139c3dfff/python/src/convert.cpp#L613). It calls [one of `array`'s constructor](https://github.com/ml-explore/mlx/blob/255f953f99c3403df19fa4d92462143139c3dfff/mlx/array.h#L542-L549), which initializes `array_desc_` via `ArrayDesc`'s [constructor](https://github.com/ml-explore/mlx/blob/255f953f99c3403df19fa4d92462143139c3dfff/mlx/array.cpp#L259-L262) and its `init()` function. Notice that these *leaf* arrays are immediately `available`, i.e., **the data is materialized right away and no evaluation is needed**. So a question worth to think about: *would leaf arrays need a separate method to capture the stack?*
 
 `c = a + b`, on the other hand, invokes `a.__add__(b)`, which [calls `mx::add(a, b)`](https://github.com/ml-explore/mlx/blob/255f953f99c3403df19fa4d92462143139c3dfff/python/src/array.cpp#L547-L556) that is defined in [`mlx/ops.cpp`](https://github.com/ml-explore/mlx/blob/255f953f99c3403df19fa4d92462143139c3dfff/mlx/ops.cpp#L2947-L2954). It in turn calls [an `array`'s constructor](https://github.com/ml-explore/mlx/blob/255f953f99c3403df19fa4d92462143139c3dfff/mlx/array.cpp#L19-L40), [an `ArrayDesc`'s constructor](https://github.com/ml-explore/mlx/blob/255f953f99c3403df19fa4d92462143139c3dfff/mlx/array.cpp#L264-L275), and invokes ArrayDesc's `init()`.
 
-`.reshape()` is an interesting one since it can behave in several ways. `mx.reshape(a, (4, 1))` (producing node `K` in the figure) and `mx.reshape(c, (1, 4))` (node `L`) follow paths similar to the operations above, ending in the `array` and `ArrayDesc` constructors. Note that creating a new `array` and `array_desc_` doesn't necessarily mean memory gets allocated at `eval` time. During `eval`, MLX first [checks the input's layout](https://github.com/ml-explore/mlx/blob/255f953f99c3403df19fa4d92462143139c3dfff/mlx/backend/common/common.cpp#L148-L180). A row-contiguous input always yields a view, otherwise MLX still tries to express the new shape as strides over the existing buffer. It only copies as the last resort. When a view is produced, the new `ArrayDesc` points to the same data instead of allocating a new buffer (recall the third level of sharing mentioned above).
+`.reshape()` is an interesting one since it can behave in several ways. `mx.reshape(a, (4, 1))` (producing node `K` in the figure) and `mx.reshape(c, (1, 4))` (node `L`) follow paths similar to the operations above, ending in the `array` and `ArrayDesc` constructors. Note that **creating a new `array` and `array_desc_` doesn't necessarily mean memory gets allocated at `eval` time**. During `eval`, MLX first [checks the input's layout](https://github.com/ml-explore/mlx/blob/255f953f99c3403df19fa4d92462143139c3dfff/mlx/backend/common/common.cpp#L148-L180). A row-contiguous input always yields a view, otherwise MLX still tries to express the new shape as strides over the existing buffer. It only copies as the last resort. When a view is produced, the new `ArrayDesc` points to the same data instead of allocating a new buffer (recall the third level of sharing mentioned above). To repeat, *a node/array creation doesn't always lead to memory allocation*.
 
 `out2 = d.reshape((4, 4))`, on the other hand, behaves differently. You might have noticed `d` is missing in the figure! What happened to `d`? By this point, `d`'s shape is already `(4, 4)`, so [`reshape()` function](https://github.com/ml-explore/mlx/blob/255f953f99c3403df19fa4d92462143139c3dfff/mlx/ops.cpp#L413-L423) simply returns `d` by value, copy-constructing a new handle. `out2` and `d` are therefore two different `array` handles sharing one `ArrayDesc` (the first level of sharing above).
 
 One other operation I'd like to highlight is `split()`, which produces multiple outputs (i.e., generating new `array` objects with their own `ArrayDesc`s) that share a single `split` primitive (the second level of sharing above). Each output holds references to the others as its `siblings`.
 
-In summary, **`array`-related Python operations that may end up with allocations all pass through `ArrayDesc`'s `init()`**. It runs while Python frame that created the array is still on the stack.
+In summary, **`array`-related Python operations that may(!!!) end up with allocations all pass through `ArrayDesc`'s `init()`**. It runs while Python frame that created the array is still on the stack. Several other important things include:
+
+- We may need to capture the traceback separately for leaf arrays.
+- A node/array creation does not always lead to memory allocation.
+- (Not discussed above) A single operation may lead to multiple nodes being created. For example, when broadcasting is needed to run an operation, it creates one node for the broadcast and another for the operation itself.
 
 <hr class="hr-single" />
 
-### When `eval` is triggered
+### What happens when `eval` is triggered
 
 When we run `mx.eval(out1, out2, out3)` at the end, it passes through [these lines](https://github.com/ml-explore/mlx/blob/255f953f99c3403df19fa4d92462143139c3dfff/python/src/transforms.cpp#L1187-L1192) before reaching the core function [`eval()`](https://github.com/ml-explore/mlx/blob/255f953f99c3403df19fa4d92462143139c3dfff/mlx/transforms.cpp#L336-L351). As long as there's any unscheduled graph work, it calls `eval_impl()` and waits for it to finish.
 
@@ -412,7 +433,7 @@ Here are the implementation steps. My main goal at this point is a working proto
 3. [Implement traceback capture.](#3-implement-traceback-capture)
 4. [Format the output to match PyTorch's snapshot format.](#4-format-the-output-to-match-pytorchs-snapshot-format)
 
-While my earlier descriptions referenced a specific commit of MLX (and PyTorch), my implementation is based on the most recent MLX release (v0.32.1).
+While my earlier descriptions referenced a specific commit of MLX (and PyTorch), my implementation is based on the commit tagged as the latest MLX release a the time (`v0.32.1`)
 
 <hr class="hr-single" />
 
@@ -420,8 +441,8 @@ While my earlier descriptions referenced a specific commit of MLX (and PyTorch),
 
 This step is fairly straightforward and it entails the following substeps:
 
-   - [Backend] Implement a recording function, along with a class representing a memory event, and call it from the allocator's allocation and deallocation paths.
-   - [Backend] Ensure the memory event class contains a flag to indicate whether the recording is enabled or not.
+   - [C++ Backend] Implement a recording function, along with a class representing a memory event, and call it from the allocator's allocation and deallocation paths.
+   - [C++ Backend] Ensure the memory event class contains a flag to indicate whether the recording is enabled or not.
    - [Python-facing] Provide a functionality to toggle the recording functionality (similar to PyTorch's `_record_memory_history()`).
    - [Python-facing] Expose the captured events to Python (for testing purposes).
 
@@ -467,7 +488,7 @@ Possibly the most challenging part of the implementation for me. I relied heavil
 
 #### Challenges
 
-In both PyTorch and MLX, there is a Python layer and a C++ layer. The allocator runs in pure C++ and handles allocations, deallocations, and trace recording. Meanwhile, we want to capture Python stacks and attach the captured `PyObject`s to the recorded trace entries. Here is the catch: *the allocator cannot include Python headers* (i.e., cannot use `PyObject`). PyTorch solves this with the three layers illustrated in Figure 6 below.
+In both PyTorch and MLX, there is a Python layer and a C++ layer. The allocator runs in pure C++ and handles allocations, deallocations, and memory event recording. Meanwhile, we want to capture Python stacks and attach the captured `PyObject`s to the recorded memory event. Here is the catch: *the allocator cannot include Python headers* (i.e., cannot use `PyObject`). PyTorch solves this with the three layers illustrated in Figure 6 below.
 
 ![The layering design in PyTorch](/assets/images/2026-08-28-mlx_memory_viz/plan3_pytorch.png)
 <p style="text-align: center;"><i>Figure 6. The layering design in PyTorch.</i></p>
@@ -484,7 +505,7 @@ In both PyTorch and MLX, there is a Python layer and a C++ layer. The allocator 
 </div>
 <!-- END OF DIV -->
 
-Here is where the problem lies. Layer 2 *owns* strong references to code objects but cannot safely release them. Releasing means `Py_DECREF`, which may only be called when holding the GIL, and `~CapturedTraceback` can run on a thread that is currently holding the allocator's device lock. Acquiring the GIL there can deadlock (explained in the comments [here](https://github.com/pytorch/pytorch/blob/68b353e2d8b7879b819209055f5524d0e7a1e9d1/torch/csrc/profiler/python/combined_traceback.cpp#L10-L21)): one thread holds the GIL and waits for the device lock, while another holds the device lock and waits for the GIL. So instead of freeing immediately, the destructor defers. It pushes the doomed frame pointers onto a global `to_free_frames` vector. The actual `Py_DECREF`s happen at the top of the next `gather()` call, which by construction holds the GIL and runs outside the device lock.
+Here is where the problem lies. Layer 2 *owns* strong references to code objects but cannot safely release them. Releasing means `Py_DECREF`, which may only be called when holding the GIL, and `~CapturedTraceback` can run on a thread that is currently holding the allocator's device lock. Acquiring the GIL there can deadlock (explained in the comments [here](https://github.com/pytorch/pytorch/blob/68b353e2d8b7879b819209055f5524d0e7a1e9d1/torch/csrc/profiler/python/combined_traceback.cpp#L10-L21)): one thread holds the GIL and waits for the device lock, while another holds the device lock and waits for the GIL. So instead of freeing immediately, PyTorch implements it such that the destructor defers. It pushes the doomed frame pointers onto a global `to_free_frames` vector. The actual `Py_DECREF`s happen at the top of the next `gather()` call, which by construction holds the GIL and runs outside the device lock.
 
 #### Solution
 
@@ -492,7 +513,7 @@ To mitigate this problem, instead of passing the `PyObject*` (in the form of `vo
 
 This entails the following steps:
 
-1. In `mlx/traceback.h|cpp`, implement the hook mechanism: `set_traceback_tracking()` to enable tracking, `set_traceback_capture_func()` to install the capture hook (which is invoked by `install_traceback_capture()`), and `capture_traceback()` to invoke the hook. `capture_traceback()` returns a `TracebackId`, and the core only transports it.
+1. In `mlx/traceback.h|cpp`, implement the hook mechanism: `set_traceback_tracking()` to toggle tracking, `set_traceback_capture_func()` to install the capture hook (which is invoked by `install_traceback_capture()`), and `capture_traceback()` to invoke the hook. `capture_traceback()` returns a `TracebackId`, and the core only transports it.
 
 2. Add a new `ArrayDesc` field `traceback` for storing the traceback ID.
 
@@ -550,22 +571,22 @@ Since I don't currently capture C++ stacks, the primitive name carries most of t
 
 # Benchmarks
 
-To assess the performance of the recording functionality, I ran two kinds of benchmarks on an M3 MacBook Air (16 GB unified memory, macOS Tahoe 26.5.2):
+To assess the performance of the memory recording functionality, I ran two kinds of benchmarks on an M3 MacBook Air (16 GB unified memory, macOS Tahoe 26.5.2):
 
-1. [Cost of having the functionality implemented](#1-cost-of-having-the-functionality-implemented), i.e., no functionality vs. with functionality (recording off)
-2. [Performance of stack capture and event creation](#2-performance-of-stack-capture-and-event-creation)
+1. [Estimating the cost of having the functionality implemented](#1-estimating-the-cost-of-having-the-functionality-implemented), i.e., comparing no functionality vs. with functionality (recording off)
+2. [Assessing the performance of stack capture and event creation](#2-assessing-the-performance-of-stack-capture-and-event-creation)
 
 <hr class="hr-single" />
 
-### 1. Cost of having the functionality implemented
+### 1. Estimating the cost of having the functionality implemented
 
-Both Python stack capture and event creation are only performed when the recording is on. When it's disabled, however, the following still happen:
+Both Python stack capture and event creation are only performed when the recording is on. When the recording is disabled, however, the following still happen:
 - The invocation of `capture_traceback()` when initializing an array (which returns early if recording is disabled).
 - When eval is invoked:
   - The atomic load of `op_tracking_enabled` and the call to the `OpContext` constructor, which retrieves each array's primitive name and traceback ID.
   - The invocation of `maybe_record_events()` (which returns early if recording is disabled) in every allocation and deallocation.
 
-We don't want these steps to add noticeable cost. To measure this, I added two Python benchmark functions:
+We don't want these steps to add noticeable cost. To measure this, I added two Python benchmark functions below.
 
 ```python
 def benchmark_full():
@@ -618,7 +639,7 @@ def benchmark_add():
   time_fn(run_benchmark)
 ```
 
-Notice the tiny array size. Since event and array (relevant for stack capture) counts are independent from array size, shrinking the size would help maximizing the overhead's visibility by collapsing the per-op baseline. Each op runs 1000 times per batch across 50 batches. Some warmup steps are also run beforehand. Additionally, the benchmark was run on CPU since the scheduling and synchronization cost in GPU may end up swamping the effect being measured.
+Notice the tiny array size. Since event and array (relevant for stack capture) counts are independent from array size, shrinking the size would help maximizing the overhead's visibility by collapsing the per-op baseline. Each op runs 1000 times per batch across 50 batches. Some warmup steps are also run beforehand. Additionally, the benchmark was run on the CPU since the scheduling and synchronization cost in the GPU may end up swamping the effect being measured.
 
 ![Benchmark 1](/assets/images/2026-08-28-mlx_memory_viz/benchmark_1.png)
 <p style="text-align: center;"><i>Figure 8. Benchmark 1 results. <code>no memviz</code> represents the original MLX code (v0.32.1) and <code>memviz disabled</code> represents MLX v0.32.1 + memory recording implemented but disabled. The error bars represent 95% confidence interval.</i></p>
@@ -631,21 +652,21 @@ In summary, according to this benchmark result, **adding the memory recording im
 
 <hr class="hr-single" />
 
-### 2. Performance of stack capture and event creation
+### 2. Assessing the performance of stack capture and event creation
 
 When memory recording is enabled, recall that the Python stack is captured during graph construction and the memory events are captured when eval is triggered. Specifically,
 
-- Memory recording enabled, no eval: for each node creation in the graph,
+- For each node creation in the graph:
   - Invokes `capture_traceback()`, which captures the Python stacks with a maximum depth of 32 frames
   - Interns the stack
 
-- Memory recording enabled, with eval: when eval is invoked,
+- When eval is invoked:
   - Atomic loads `op_tracking_enabled` and creates (and destroys) `OpContext`, which retrieves each array's primitive name and traceback ID during creation
   - Invokes a complete `maybe_record_events()` in every allocation and deallocation
 
-In this benchmark, we hope to measure the cost of 1) each stack capture (including the stack interning) and 2) the event creation. To do so, we run the same benchmark functions above with memory recording on and off, once with no eval invocation and once with eval. The recursive function call is implemented to achieve a maximum depth of 32 frames, which is the maximum number of walks during stack interning. The results can be found in the table below.
+In this benchmark, we hope to measure the cost of 1) each stack capture (including the stack interning) and 2) the event creation. To do so, we run the same benchmark functions above with memory recording on and off, once with no eval invocation and once with eval. The recursive function call is implemented to reach 32 frames, which is the maximum number of walks during stack interning. The results can be found in the table below.
 
-**Durations [95% CI intervals] of `full` operations along with computed stack capture and event creation costs (all in μsec)**, 50 x 1,000 repetitions, full 32 frames
+**Durations [95% CI intervals] of `full` operations, along with computed stack-capture and event-creation costs (all in μsec)**, 50 × 1,000 repetitions
 
 | eval invoked | # Ops | # Ops Events* | `memviz disabled` | `memviz enabled` | Cost of stack capture | Cost of event creation |
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|
@@ -658,12 +679,19 @@ In this benchmark, we hope to measure the cost of 1) each stack capture (includi
 
 Table remarks:
 - `NC` = `Not computed`
-- `# Ops Events` here includes the events created across all batches and iterations. Recall that we repeat the function 50 x 1000 times. If there are 1 million events created, then each op creates $(1,000,000 / 50,000) / 10 ops = 2 events/op$. 
+- `# Ops Events` here includes the events created across all batches and iterations. Recall that we repeat the function 50 × 1,000 times. If there are 1 million events created, then each op creates $(1,000,000 / 50,000) / 10\ ops = 2\ events/op$. 
+
+<!-- START OF DIV -->
+<div class="div-author-note">
+<h4>Author's Note</h4>
+I'm not generating a bar plot here since it's pretty clear that enabling recording leads to a much longer run. My goal here is to estimate the recording cost, so I feel showing the numbers directly would be more helpful.
+</div>
+<!-- END OF DIV -->
 
 To compute the cost of each stack capture, we can use the following formula:
 
 $$
-t_{each\_stack\_capture} = \frac{(t_{memviz\_enabled\_no\_eval} - t_{memviz\_disabled\_no\_eval})}{\# arrays\_created}
+t_{each\_stack\_capture} = \frac{(t_{memviz\_enabled\_no\_eval} - t_{memviz\_disabled\_no\_eval})}{\#\ arrays\ created}
 $$
 
 For instance, the cost of each stack capture given 10 `full` operations would be:
@@ -677,7 +705,7 @@ The denominator comes from 10 operations multiplied by two arrays constructed in
 As for the cost of an event creation, we can use the following formula:
 
 $$
-t_{each\_event\_creation} = \frac{(t_{memviz\_enabled\_with\_eval} - t_{memviz\_disabled\_with\_eval}) - (t_{all\_stack\_capture})}{\# events}
+t_{each\_event\_creation} = \frac{(t_{memviz\_enabled\_with\_eval} - t_{memviz\_disabled\_with\_eval}) - (t_{all\_stack\_captures})}{\#\ events}
 $$
 
 where 
@@ -695,7 +723,7 @@ Computing the rest would lead to the values shown in the table above. Based on t
 
 Running the same benchmark method on the `add` op lead to similar results.
 
-**Durations [95% CI intervals] of `add` operations along with computed stack capture and event creation costs (all in μsec)**, 50 x 1,000 repetitions, full 32 frames
+**Durations [95% CI intervals] of `add` operations, along with computed stack capture and event creation costs (all in μsec)**, 50 × 1,000 repetitions
 
 | eval invoked | # Ops | # Ops Events | `memviz disabled` | `memviz enabled` | Cost of stack capture | Cost of event creation |
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|
@@ -706,13 +734,13 @@ Running the same benchmark method on the `add` op lead to similar results.
 | No | 30 | 0 | 40.846 [40.742, 40.951] | 92.290 [92.168, 98.332] | 1.715 | - |
 | Yes | 30 | 3M | 88.272 [87.986, 88.559] | 137.333 [136.924, 137.741] | NC | -0.079 |
 
-To summarize, **each stack capture (which occurs when an array is created) costs roughly 1.8 μsec, while the cost of each event creation might be almost negligible.** 
+To summarize, **each stack capture (which occurs when an array node is created) costs roughly 1.8 μsec, while the cost of each event creation might be almost negligible.** 
 
 <hr class="hr-top" /><hr />
 
 # Limitations and potential improvements
 
-Some limitations and potential improvements include:
+Since this is only a preliminary implementation, there are many limitations and potential improvements. Some functionality-related limitations and improvements include:
 
 1. Currently Metal-only recording, which doesn't work for non-Metal backends (e.g., CUDA).
 2. Only Python stacks are captured.
@@ -722,9 +750,9 @@ Some limitations and potential improvements include:
 
 # Summary
 
-To reiterate, the goal of this post was to help myself work through the designs behind PyTorch and MLX, and my reasoning for how I implemented memory viz for MLX. The current implementation captures Python stacks during computation graph construction and creates memory events for each allocation/deallocation when eval is invoked. Based on the benchmarks, the cost of including the feature (when disabled) is negligible. The only overhead comes from capturing each stack during graph construction, at approximately 1.8 μsec per array created.
+To reiterate, the goal of this post was to help myself work through the designs behind PyTorch and MLX, and my reasoning for how I implemented memory viz for MLX. The current implementation captures Python stacks during computation graph construction and creates memory events for each allocation/deallocation when eval is invoked. Based on the benchmarks, the cost of including the feature (when disabled) seems negligible. The only overhead comes from capturing each stack during graph construction, at approximately 1.8 μsec per array created when the maximum frame depth is always reached.
 
-Overall this has been a great learning experience. Everything I picked up about C++ along the way also led me to discover some really helpful CppCon talks! I don't know where this project will go, but I hope it turns out to be useful to others too.
+Overall this has been a great learning experience! I've also discovered some really helpful CppCon talks and speakers/book authors along the way! I don't know where this project will go, but I hope it turns out to be useful to others, too.
 
 <hr class="hr-top" /><hr />
 
@@ -737,4 +765,4 @@ The benchmark results are as follows.
 ![C++ Benchmark](/assets/images/2026-08-28-mlx_memory_viz/benchmark_cpp.png)
 <p style="text-align: center;"><i>Figure 9. C++ benchmark results.</i></p>
 
-Consistent with the benchmark results above, the difference in performance between the two conditions (recording on or off) only seems to be impacted by noise rather than a clear event-creation overhead. 
+Consistent with the benchmark results we previously looked at, the difference in performance between the two conditions (recording on vs off) only seems to be impacted by noise rather than a clear event-creation overhead. 
