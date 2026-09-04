@@ -8,6 +8,9 @@ katex: true
 
 In this post, I will walk through how I implemented a *preliminary* memory event recorder in MLX where the recorded events can be dumped into a pickle file compatible with PyTorch's memory viz web app. The main goal of this write-up is mostly to help myself understand what I'm actually doing, as much as I can. If you have any input or feedback, I'd love to hear it! 
 
+![Screenshot example](/assets/images/2026-08-28-mlx_memory_viz/main.png)
+<p style="text-align: center;"><i>A screenshot example, produced using the code <a href="https://github.com/kathsucurry/mlx-gpt-dev">here</a>. Note: if you're wondering why there's nothing allocated in between the iterations, that's because the data is allocated outside of memory recording, and currently, only <code>device_traces</code> is implemented.</i></p>
+
 The post is organized into the following sections:
 
 - [Quick How-To](#quick-how-to)
@@ -744,7 +747,8 @@ Since this is only a preliminary implementation, there are many limitations and 
 
 1. Currently Metal-only recording, which doesn't work for non-Metal backends (e.g., CUDA).
 2. Only Python stacks are captured.
-3. No stream index recorded for free events. Currently the streams for free events are set to -1.
+3. No stream index recorded for free events. Currently the streams for free events are set to -1 and are replaced in the `to_snapshot()` function if a matching allocation event is found.
+4. Traces are often dominated by tiny scalar allocations (4-8 bytes), which mainly come from leaf arrays created from Python scalars (e.g., parameter operands). A minimum size threshold may be added to avoid recording these traces.
 
 <hr class="hr-top" /><hr />
 
